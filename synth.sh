@@ -11,6 +11,15 @@ import curses, numpy as np, sounddevice as sd
 import os, threading, time, textwrap, wave
 from collections import deque
 
+try:
+    import mido
+    MIDI_AVAILABLE = True
+    MIDI_IMPORT_ERROR = ""
+except Exception as exc:
+    mido = None
+    MIDI_AVAILABLE = False
+    MIDI_IMPORT_ERROR = str(exc)
+
 SAMPLE_RATE   = 44100
 BLOCK_SIZE    = 1024
 SCOPE_SAMPLES = 2048
@@ -44,6 +53,35 @@ KEYBOARD_OFFSETS = {
 }
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 THEME_NAMES = ["MAGENTA", "MINT", "AMBER"]
+SETTINGS_PAGE_NAMES = ["MAIN", "MIDI DEV", "MIDI NOTE", "MIDI MAP"]
+MIDI_PAD_TARGETS = [
+    ("pad_kick", "Pad Kick", "note"),
+    ("pad_snare", "Pad Snare", "note"),
+    ("pad_clap", "Pad Clap", "note"),
+    ("pad_hihat", "Pad HiHat", "note"),
+    ("pad_tom", "Pad Tom", "note"),
+    ("pad_cym", "Pad Cym", "note"),
+    ("pad_loop_play", "Pad Loop Play", "note"),
+    ("pad_global_rec", "Pad Wav Rec", "note"),
+]
+MIDI_CC_TARGETS = [
+    ("cc_volume", "Knob Volume", "cc"),
+    ("cc_cutoff", "Knob Cutoff", "cc"),
+    ("cc_resonance", "Knob Reson", "cc"),
+    ("cc_drive", "Knob Drive", "cc"),
+    ("cc_delay_mix", "Knob Delay Mix", "cc"),
+    ("cc_delay_feedback", "Knob Delay Fbk", "cc"),
+    ("cc_delay_time", "Knob Delay Time", "cc"),
+    ("cc_warmth", "Knob Warmth", "cc"),
+    ("cc_air", "Knob Air", "cc"),
+    ("cc_reverb", "Knob Reverb", "cc"),
+    ("cc_bpm", "Knob Drum BPM", "cc"),
+    ("cc_osc1_level", "Knob Osc1 Level", "cc"),
+    ("cc_osc2_level", "Knob Osc2 Level", "cc"),
+]
+MIDI_BIND_TARGETS = MIDI_PAD_TARGETS + MIDI_CC_TARGETS
+MIDI_BIND_LABELS = {target_id: label for target_id, label, _ in MIDI_BIND_TARGETS}
+MIDI_BIND_KINDS = {target_id: kind for target_id, _, kind in MIDI_BIND_TARGETS}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SYNTH STATE
@@ -51,9 +89,9 @@ THEME_NAMES = ["MAGENTA", "MINT", "AMBER"]
 synth = {
     "volume": 0.5,
     "volume_current": 0.5,
-    "base_midi": 60, "active_offset": None,
+    "base_midi": 60, "key_offset": None, "midi_note": None,
     "attack":  0.01, "release": 0.3, "env": 0.0,
-    "gate_mode": 0, "note_on": False,
+    "gate_mode": 0, "key_note_on": False, "midi_note_on": False,
     "lfo_wave": 0, "lfo_rate": 2.0, "lfo_depth": 0.0,
     "lfo_depth_current": 0.0,
     "lfo_target": 0, "lfo_phase": 0.0,
@@ -125,6 +163,29 @@ ui_state = {
     "scope_show_drums": True,
 }
 ui_lock = threading.Lock()
+
+midi = {
+    "enabled": False,
+    "devices": [],
+    "device_index": 0,
+    "device_name": "",
+    "channel": -1,
+    "note_input": True,
+    "pad_input": True,
+    "status": "MIDI unavailable" if not MIDI_AVAILABLE else "MIDI idle",
+    "last_message": "",
+    "input_port": None,
+    "learn_mode": "off",
+    "learn_target_index": 0,
+    "note_edit_in": 60,
+    "note_edit_out": 60,
+    "note_map": {},
+    "note_bindings": {target_id: None for target_id, _, kind in MIDI_BIND_TARGETS if kind == "note"},
+    "cc_bindings": {target_id: None for target_id, _, kind in MIDI_BIND_TARGETS if kind == "cc"},
+    "held_notes": {},
+    "held_order": [],
+}
+midi_lock = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DRUM STATE
@@ -287,8 +348,13 @@ def sync_pitch_locked():
         synth["freq_current"] = target
 
 def current_play_midi_locked():
-    active = synth["active_offset"]
+    if synth["midi_note_on"] and synth["midi_note"] is not None:
+        return int(synth["midi_note"])
+    active = synth["key_offset"]
     return int(synth["base_midi"]) + (active if active is not None else 0)
+
+def note_active_locked():
+    return bool(synth["key_note_on"] or synth["midi_note_on"])
 
 def current_play_freq_locked():
     return midi_to_freq(current_play_midi_locked())
@@ -298,6 +364,243 @@ def active_osc_locked():
 
 def current_drum_bank_locked():
     return DRUM_BANKS[drum["bank"]]
+
+def short_label(text, width):
+    text = str(text)
+    if len(text) <= width:
+        return text
+    return text[:max(0, width - 1)] + "…"
+
+def format_binding_value(kind, value):
+    if value is None:
+        return "--"
+    return f"CC {value:03d}" if kind == "cc" else f"NOTE {midi_to_name(value):>3}"
+
+def format_midi_message(message):
+    if hasattr(message, "channel"):
+        ch_text = f" ch{message.channel + 1}"
+    else:
+        ch_text = ""
+    if message.type == "note_on" and getattr(message, "velocity", 0) > 0:
+        return f"NOTE {midi_to_name(message.note):>3} v{message.velocity:03d}{ch_text}"
+    if message.type in ("note_off", "note_on"):
+        return f"NOTE OFF {midi_to_name(message.note):>3}{ch_text}"
+    if message.type == "control_change":
+        return f"CC {message.control:03d} val{message.value:03d}{ch_text}"
+    return short_label(str(message), 40)
+
+def refresh_midi_devices_locked():
+    if not MIDI_AVAILABLE:
+        midi["devices"] = []
+        midi["device_index"] = 0
+        midi["device_name"] = ""
+        midi["status"] = short_label(f"MIDI unavailable: {MIDI_IMPORT_ERROR}", 42)
+        return
+    try:
+        names = list(mido.get_input_names())
+    except Exception as exc:
+        midi["devices"] = []
+        midi["device_index"] = 0
+        midi["device_name"] = ""
+        midi["status"] = short_label(f"MIDI scan failed: {exc}", 42)
+        return
+
+    current_name = midi["device_name"]
+    midi["devices"] = names
+    if not names:
+        midi["device_index"] = 0
+        midi["device_name"] = ""
+        if midi["enabled"]:
+            midi["status"] = "No MIDI inputs found"
+        return
+    if current_name in names:
+        midi["device_index"] = names.index(current_name)
+        midi["device_name"] = current_name
+    else:
+        midi["device_index"] = int(clamp(midi["device_index"], 0, len(names) - 1))
+        midi["device_name"] = names[midi["device_index"]]
+
+def set_midi_note_locked(note, is_on):
+    if is_on:
+        synth["midi_note"] = int(note)
+        synth["midi_note_on"] = True
+    else:
+        synth["midi_note_on"] = False
+        synth["midi_note"] = None
+    sync_pitch_locked()
+
+def clear_midi_note_state():
+    with midi_lock:
+        midi["held_notes"].clear()
+        midi["held_order"] = []
+    with synth_lock:
+        set_midi_note_locked(None, False)
+
+def handle_pad_action(target_id):
+    if target_id == "pad_kick":
+        with drum_lock: drum["trig"][0] = True
+    elif target_id == "pad_snare":
+        with drum_lock: drum["trig"][1] = True
+    elif target_id == "pad_clap":
+        with drum_lock: drum["trig"][2] = True
+    elif target_id == "pad_hihat":
+        with drum_lock: drum["trig"][3] = True
+    elif target_id == "pad_tom":
+        with drum_lock: drum["trig"][4] = True
+    elif target_id == "pad_cym":
+        with drum_lock: drum["trig"][5] = True
+    elif target_id == "pad_loop_play":
+        with loop_lock:
+            if loop["has_audio"]:
+                loop["playing"] = not loop["playing"]
+    elif target_id == "pad_global_rec":
+        if global_rec["recording"]:
+            stop_global_recording()
+        else:
+            start_global_recording()
+
+def apply_midi_cc_target(target_id, value):
+    norm = clamp(value / 127.0, 0.0, 1.0)
+    if target_id == "cc_bpm":
+        with drum_lock:
+            drum["bpm"] = 40.0 + norm * 260.0
+        return
+
+    with synth_lock:
+        if target_id == "cc_volume":
+            synth["volume"] = norm
+        elif target_id == "cc_cutoff":
+            synth["filter_on"] = True
+            synth["cutoff"] = norm
+        elif target_id == "cc_resonance":
+            synth["filter_on"] = True
+            synth["resonance"] = norm * 0.99
+        elif target_id == "cc_drive":
+            synth["fx_drive"] = norm
+        elif target_id == "cc_delay_mix":
+            synth["fx_delay_mix"] = norm
+        elif target_id == "cc_delay_feedback":
+            synth["fx_delay_feedback"] = norm * 0.95
+        elif target_id == "cc_delay_time":
+            synth["fx_delay_time"] = norm
+        elif target_id == "cc_warmth":
+            synth["fx_warmth"] = norm
+        elif target_id == "cc_air":
+            synth["fx_air"] = norm
+        elif target_id == "cc_reverb":
+            synth["fx_reverb"] = norm
+        elif target_id == "cc_osc1_level":
+            synth["oscillators"][0]["level"] = norm
+        elif target_id == "cc_osc2_level":
+            synth["oscillators"][1]["level"] = norm
+
+def on_midi_message(message):
+    if hasattr(message, "channel"):
+        msg_channel = int(message.channel)
+    else:
+        msg_channel = -1
+
+    with midi_lock:
+        midi["last_message"] = format_midi_message(message)
+        learn_mode = midi["learn_mode"]
+        learn_target = MIDI_BIND_TARGETS[midi["learn_target_index"]]
+        enabled = midi["enabled"]
+        selected_channel = midi["channel"]
+        note_input = midi["note_input"]
+        pad_input = midi["pad_input"]
+
+        if learn_mode == "note_src" and message.type == "note_on" and getattr(message, "velocity", 0) > 0:
+            midi["note_edit_in"] = int(message.note)
+            midi["learn_mode"] = "off"
+            midi["status"] = f"Source note learned: {midi_to_name(message.note)}"
+            return
+
+        if learn_mode == "bind":
+            target_id, label, kind = learn_target
+            if kind == "cc" and message.type == "control_change":
+                midi["cc_bindings"][target_id] = int(message.control)
+                midi["learn_mode"] = "off"
+                midi["status"] = f"Bound {label} to CC {message.control}"
+                return
+            if kind == "note" and message.type == "note_on" and getattr(message, "velocity", 0) > 0:
+                midi["note_bindings"][target_id] = int(message.note)
+                midi["learn_mode"] = "off"
+                midi["status"] = f"Bound {label} to {midi_to_name(message.note)}"
+                return
+
+        if not enabled:
+            return
+        if selected_channel >= 0 and msg_channel >= 0 and msg_channel != selected_channel:
+            return
+
+        pad_target = None
+        if pad_input and message.type == "note_on" and getattr(message, "velocity", 0) > 0:
+            for target_id, note_value in midi["note_bindings"].items():
+                if note_value == int(message.note):
+                    pad_target = target_id
+                    break
+
+        mapped_note = midi["note_map"].get(int(getattr(message, "note", 0)), int(getattr(message, "note", 0)))
+        if pad_target is None and message.type == "note_on" and getattr(message, "velocity", 0) > 0 and note_input:
+            midi["held_notes"][int(message.note)] = mapped_note
+            midi["held_order"] = [src for src in midi["held_order"] if src != int(message.note)] + [int(message.note)]
+        elif pad_target is None and message.type in ("note_off", "note_on") and (message.type == "note_off" or getattr(message, "velocity", 0) == 0):
+            midi["held_notes"].pop(int(message.note), None)
+            midi["held_order"] = [src for src in midi["held_order"] if src != int(message.note)]
+
+    if pad_target is not None:
+        handle_pad_action(pad_target)
+        return
+
+    if message.type == "control_change":
+        with midi_lock:
+            cc_target = next((target_id for target_id, cc_value in midi["cc_bindings"].items() if cc_value == int(message.control)), None)
+        if cc_target is not None:
+            apply_midi_cc_target(cc_target, int(message.value))
+        return
+
+    if note_input and message.type in ("note_on", "note_off"):
+        with midi_lock:
+            active_note = midi["held_notes"][midi["held_order"][-1]] if midi["held_order"] else None
+        with synth_lock:
+            if active_note is None:
+                set_midi_note_locked(None, False)
+            else:
+                set_midi_note_locked(active_note, True)
+
+def reopen_midi_input():
+    with midi_lock:
+        refresh_midi_devices_locked()
+        enabled = midi["enabled"] and MIDI_AVAILABLE
+        device_name = midi["device_name"]
+        old_port = midi["input_port"]
+        midi["input_port"] = None
+
+    if old_port is not None:
+        try:
+            old_port.close()
+        except Exception:
+            pass
+
+    if not enabled:
+        clear_midi_note_state()
+        with midi_lock:
+            midi["status"] = "MIDI disabled" if MIDI_AVAILABLE else short_label(f"MIDI unavailable: {MIDI_IMPORT_ERROR}", 42)
+        return
+
+    if not device_name:
+        with midi_lock:
+            midi["status"] = "No MIDI input selected"
+        return
+
+    try:
+        port = mido.open_input(device_name, callback=on_midi_message)
+        with midi_lock:
+            midi["input_port"] = port
+            midi["status"] = short_label(f"Listening: {device_name}", 42)
+    except Exception as exc:
+        with midi_lock:
+            midi["status"] = short_label(f"MIDI open failed: {exc}", 42)
 
 noise_rng = np.random.default_rng()
 
@@ -754,7 +1057,7 @@ def process_loop(live_signal):
 def gen_synth(frames):
     with synth_lock:
         target_freq = current_play_freq_locked(); vol_target = synth["volume"]
-        env       = synth["env"];   note   = synth["note_on"]
+        env       = synth["env"];   note   = note_active_locked()
         gate      = synth["gate_mode"]
         atk       = max(synth["attack"],  0.001)
         rel       = max(synth["release"], 0.001)
@@ -1232,6 +1535,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
     sections = [
         ("PLAY NOTES", [
             (["a", "w", "s", "e", "d", "f", "t", "g", "y", "h", "u", "j", "k"], "Chromatic keyboard relative to the current root."),
+            (["MIDI keys"], "External MIDI notes play the synth; note remaps live in settings."),
             (["←", "→"], "Move the base/root note down or up."),
             (["SPC"], "Release the currently held note."),
         ]),
@@ -1255,7 +1559,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
             (["TAB"], "Switch between synth focus and drum sequencer focus."),
             (["←", "→", "↑", "↓"], "Move around the drum grid while sequencer focus is active."),
             (["SPC", "r", "c", "C", "1", "2"], "Toggle step, run, clear row, clear all, or load a 32-step pattern."),
-            (["S"], "Open settings to switch drum banks and synth edit options."),
+            (["S"], "Open settings for synth, MIDI device selection, note remaps, and pad/knob learn."),
         ]),
     ]
 
@@ -1288,6 +1592,18 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
     safe_addstr(scr, goal_y, left_x, "Goal", C[1]|B)
     for i, line in enumerate(wrap_text("Layer OSC1 + OSC2 for bass/lead blends, then capture phrases with the loop controls.", inner_w - 6)):
         safe_addstr(scr, goal_y + i, left_x + 6, line, C[6])
+
+def settings_row_count(page):
+    return [13, 9, 8, 7][page]
+
+def selected_midi_bind_target_locked():
+    return MIDI_BIND_TARGETS[midi["learn_target_index"]]
+
+def selected_midi_binding_locked():
+    target_id, label, kind = selected_midi_bind_target_locked()
+    if kind == "cc":
+        return label, kind, midi["cc_bindings"].get(target_id)
+    return label, kind, midi["note_bindings"].get(target_id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN DRAW LOOP
@@ -1326,7 +1642,11 @@ def draw(stdscr):
     seq_cursor_s = 0
     focus = "synth"
     settings_open = False
+    settings_page = 0
     settings_cursor = 0
+
+    with midi_lock:
+        refresh_midi_devices_locked()
 
     try:
         while True:
@@ -1339,64 +1659,154 @@ def draw(stdscr):
             # auto-release: curses has no keyup, so we release after timeout
             if held_note is not None and (now - last_note_t) > NOTE_TIMEOUT:
                 with synth_lock:
-                    synth["note_on"] = False
-                    synth["active_offset"] = None
+                    synth["key_note_on"] = False
+                    synth["key_offset"] = None
                     sync_pitch_locked()
                 held_note = None
 
             if settings_open:
+                row_count = settings_row_count(settings_page)
                 if ch == ord('q'):
                     break
                 elif ch in (27, ord('S')):
                     settings_open = False
+                elif ch in (ord(' '), ord('\n'), 10, 13):
+                    if settings_page == 1:
+                        if settings_cursor == 1:
+                            with midi_lock:
+                                midi["enabled"] = not midi["enabled"]
+                            reopen_midi_input()
+                        elif settings_cursor == 3:
+                            with midi_lock:
+                                refresh_midi_devices_locked()
+                            reopen_midi_input()
+                    elif settings_page == 2:
+                        with midi_lock:
+                            if settings_cursor == 2:
+                                midi["learn_mode"] = "off" if midi["learn_mode"] == "note_src" else "note_src"
+                            elif settings_cursor == 4:
+                                midi["note_map"][int(midi["note_edit_in"])] = int(midi["note_edit_out"])
+                                midi["status"] = f"Mapped {midi_to_name(midi['note_edit_in'])} to {midi_to_name(midi['note_edit_out'])}"
+                            elif settings_cursor == 5:
+                                midi["note_map"].pop(int(midi["note_edit_in"]), None)
+                                midi["status"] = f"Cleared map for {midi_to_name(midi['note_edit_in'])}"
+                    elif settings_page == 3:
+                        with midi_lock:
+                            if settings_cursor == 2:
+                                midi["learn_mode"] = "off" if midi["learn_mode"] == "bind" else "bind"
+                            elif settings_cursor == 4:
+                                target_id, _, kind = selected_midi_bind_target_locked()
+                                if kind == "cc":
+                                    midi["cc_bindings"][target_id] = None
+                                else:
+                                    midi["note_bindings"][target_id] = None
+                                midi["status"] = f"Cleared {MIDI_BIND_LABELS[target_id]}"
                 elif ch == curses.KEY_UP:
-                    settings_cursor = (settings_cursor - 1) % 12
+                    settings_cursor = (settings_cursor - 1) % row_count
                 elif ch == curses.KEY_DOWN:
-                    settings_cursor = (settings_cursor + 1) % 12
+                    settings_cursor = (settings_cursor + 1) % row_count
                 elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
                     delta = -1 if ch == curses.KEY_LEFT else 1
                     if settings_cursor == 0:
-                        with ui_lock:
-                            ui_state["theme"] = (ui_state["theme"] + delta) % len(THEME_NAMES)
-                    elif settings_cursor == 1:
-                        with ui_lock:
-                            ui_state["scope_show_drums"] = not ui_state["scope_show_drums"]
-                    elif settings_cursor == 2:
-                        with drum_lock:
-                            drum["bank"] = (drum["bank"] + delta) % len(DRUM_BANKS)
-                    elif settings_cursor == 3:
-                        with synth_lock:
-                            synth["voices"] = int(clamp(synth["voices"] + delta, 1, MAX_VOICES))
-                    elif settings_cursor == 4:
-                        with synth_lock:
-                            synth["active_osc"] = (synth["active_osc"] + delta) % 2
-                    elif settings_cursor == 5:
-                        with synth_lock:
-                            active_osc_locked()["waveform"] = (active_osc_locked()["waveform"] + delta) % len(WAVEFORMS)
-                    elif settings_cursor == 6:
-                        with synth_lock:
-                            active_osc_locked()["level"] = clamp(active_osc_locked()["level"] + delta * 0.05, 0.0, 1.0)
-                    elif settings_cursor == 7:
-                        with synth_lock:
-                            active_osc_locked()["octave"] = int(clamp(active_osc_locked()["octave"] + delta, -2, 2))
-                    elif settings_cursor == 8:
-                        with synth_lock:
-                            active_osc_locked()["detune_cents"] = clamp(active_osc_locked()["detune_cents"] + delta * 2.0, -24.0, 24.0)
-                    elif settings_cursor == 9:
-                        with synth_lock:
-                            synth["fx_warmth"] = clamp(synth["fx_warmth"] + delta * 0.05, 0.0, 1.0)
-                    elif settings_cursor == 10:
-                        with synth_lock:
-                            synth["fx_air"] = clamp(synth["fx_air"] + delta * 0.05, 0.0, 1.0)
-                    elif settings_cursor == 11:
-                        with synth_lock:
-                            synth["fx_reverb"] = clamp(synth["fx_reverb"] + delta * 0.05, 0.0, 1.0)
+                        settings_page = (settings_page + delta) % len(SETTINGS_PAGE_NAMES)
+                        settings_cursor = min(settings_cursor, settings_row_count(settings_page) - 1)
+                    elif settings_page == 0:
+                        if settings_cursor == 1:
+                            with ui_lock:
+                                ui_state["theme"] = (ui_state["theme"] + delta) % len(THEME_NAMES)
+                        elif settings_cursor == 2:
+                            with ui_lock:
+                                ui_state["scope_show_drums"] = not ui_state["scope_show_drums"]
+                        elif settings_cursor == 3:
+                            with drum_lock:
+                                drum["bank"] = (drum["bank"] + delta) % len(DRUM_BANKS)
+                        elif settings_cursor == 4:
+                            with synth_lock:
+                                synth["voices"] = int(clamp(synth["voices"] + delta, 1, MAX_VOICES))
+                        elif settings_cursor == 5:
+                            with synth_lock:
+                                synth["active_osc"] = (synth["active_osc"] + delta) % 2
+                        elif settings_cursor == 6:
+                            with synth_lock:
+                                active_osc_locked()["waveform"] = (active_osc_locked()["waveform"] + delta) % len(WAVEFORMS)
+                        elif settings_cursor == 7:
+                            with synth_lock:
+                                active_osc_locked()["level"] = clamp(active_osc_locked()["level"] + delta * 0.05, 0.0, 1.0)
+                        elif settings_cursor == 8:
+                            with synth_lock:
+                                active_osc_locked()["octave"] = int(clamp(active_osc_locked()["octave"] + delta, -2, 2))
+                        elif settings_cursor == 9:
+                            with synth_lock:
+                                active_osc_locked()["detune_cents"] = clamp(active_osc_locked()["detune_cents"] + delta * 2.0, -24.0, 24.0)
+                        elif settings_cursor == 10:
+                            with synth_lock:
+                                synth["fx_warmth"] = clamp(synth["fx_warmth"] + delta * 0.05, 0.0, 1.0)
+                        elif settings_cursor == 11:
+                            with synth_lock:
+                                synth["fx_air"] = clamp(synth["fx_air"] + delta * 0.05, 0.0, 1.0)
+                        elif settings_cursor == 12:
+                            with synth_lock:
+                                synth["fx_reverb"] = clamp(synth["fx_reverb"] + delta * 0.05, 0.0, 1.0)
+                    elif settings_page == 1:
+                        midi_reopen = False
+                        clear_notes = False
+                        with midi_lock:
+                            if settings_cursor == 1:
+                                midi["enabled"] = not midi["enabled"]
+                                midi_reopen = True
+                            elif settings_cursor == 2:
+                                refresh_midi_devices_locked()
+                                if midi["devices"]:
+                                    midi["device_index"] = (midi["device_index"] + delta) % len(midi["devices"])
+                                    midi["device_name"] = midi["devices"][midi["device_index"]]
+                                    midi_reopen = True
+                            elif settings_cursor == 3:
+                                refresh_midi_devices_locked()
+                                midi_reopen = True
+                            elif settings_cursor == 4:
+                                midi["channel"] = -1 if delta < 0 and midi["channel"] == 0 else int(clamp(midi["channel"] + delta, -1, 15))
+                            elif settings_cursor == 5:
+                                midi["note_input"] = not midi["note_input"]
+                                clear_notes = not midi["note_input"]
+                            elif settings_cursor == 6:
+                                midi["pad_input"] = not midi["pad_input"]
+                        if clear_notes:
+                            clear_midi_note_state()
+                        if midi_reopen:
+                            reopen_midi_input()
+                    elif settings_page == 2:
+                        with midi_lock:
+                            if settings_cursor == 1:
+                                midi["note_edit_in"] = int(clamp(midi["note_edit_in"] + delta, 0, 127))
+                            elif settings_cursor == 2:
+                                midi["learn_mode"] = "off" if midi["learn_mode"] == "note_src" else "note_src"
+                            elif settings_cursor == 3:
+                                midi["note_edit_out"] = int(clamp(midi["note_edit_out"] + delta, 0, 127))
+                            elif settings_cursor == 4:
+                                midi["note_map"][int(midi["note_edit_in"])] = int(midi["note_edit_out"])
+                                midi["status"] = f"Mapped {midi_to_name(midi['note_edit_in'])} to {midi_to_name(midi['note_edit_out'])}"
+                            elif settings_cursor == 5:
+                                midi["note_map"].pop(int(midi["note_edit_in"]), None)
+                                midi["status"] = f"Cleared map for {midi_to_name(midi['note_edit_in'])}"
+                    elif settings_page == 3:
+                        with midi_lock:
+                            if settings_cursor == 1:
+                                midi["learn_target_index"] = (midi["learn_target_index"] + delta) % len(MIDI_BIND_TARGETS)
+                            elif settings_cursor == 2:
+                                midi["learn_mode"] = "off" if midi["learn_mode"] == "bind" else "bind"
+                            elif settings_cursor == 4:
+                                target_id, _, kind = selected_midi_bind_target_locked()
+                                if kind == "cc":
+                                    midi["cc_bindings"][target_id] = None
+                                else:
+                                    midi["note_bindings"][target_id] = None
+                                midi["status"] = f"Cleared {MIDI_BIND_LABELS[target_id]}"
             else:
                 if ch == ord('\t'):
                     focus = "seq" if focus=="synth" else "synth"
                     with synth_lock:
-                        synth["note_on"] = False
-                        synth["active_offset"] = None
+                        synth["key_note_on"] = False
+                        synth["key_offset"] = None
                         sync_pitch_locked()
                     held_note = None
                 elif ch == ord('S'):
@@ -1404,8 +1814,8 @@ def draw(stdscr):
                 elif focus == "synth":
                     if ch in KEYBOARD_OFFSETS:
                         with synth_lock:
-                            synth["active_offset"] = KEYBOARD_OFFSETS[ch]
-                            synth["note_on"] = True
+                            synth["key_offset"] = KEYBOARD_OFFSETS[ch]
+                            synth["key_note_on"] = True
                             sync_pitch_locked()
                             play_midi = current_play_midi_locked()
                         last_note   = midi_to_name(play_midi)
@@ -1413,8 +1823,8 @@ def draw(stdscr):
                         last_note_t = now
                     elif ch == ord(' '):
                         with synth_lock:
-                            synth["note_on"] = False
-                            synth["active_offset"] = None
+                            synth["key_note_on"] = False
+                            synth["key_offset"] = None
                             sync_pitch_locked()
                         held_note = None
                     elif ch == ord('q'):
@@ -1564,7 +1974,7 @@ def draw(stdscr):
                 vol=synth["volume"]; freq=current_play_freq_locked()
                 base_midi=synth["base_midi"]; voices=synth["voices"]
                 atk=synth["attack"]; rel=synth["release"]; env=synth["env"]
-                note=synth["note_on"]; gate=synth["gate_mode"]
+                note=note_active_locked(); gate=synth["gate_mode"]
                 lfo_wf=synth["lfo_wave"]; lfo_rate=synth["lfo_rate"]
                 lfo_dep=synth["lfo_depth"]; lfo_tgt=synth["lfo_target"]
                 filt_on=synth["filter_on"]; cutoff=synth["cutoff"]
@@ -1598,6 +2008,22 @@ def draw(stdscr):
             with ui_lock:
                 theme=ui_state["theme"]
                 scope_show_drums=ui_state["scope_show_drums"]
+
+            with midi_lock:
+                midi_enabled = midi["enabled"]
+                midi_device_name = midi["device_name"]
+                midi_device_count = len(midi["devices"])
+                midi_status = midi["status"]
+                midi_last_message = midi["last_message"]
+                midi_channel = midi["channel"]
+                midi_note_input = midi["note_input"]
+                midi_pad_input = midi["pad_input"]
+                midi_learn_mode = midi["learn_mode"]
+                midi_note_edit_in = midi["note_edit_in"]
+                midi_note_edit_out = midi["note_edit_out"]
+                midi_note_map_count = len(midi["note_map"])
+                midi_note_map_current = midi["note_map"].get(midi_note_edit_in)
+                midi_target_label, midi_target_kind, midi_target_value = selected_midi_binding_locked()
 
             with drum_lock:
                 d_steps   = [row[:] for row in drum["steps"]]
@@ -1813,7 +2239,7 @@ def draw(stdscr):
 
             # footer
             if settings_open:
-                ftr = " ↑↓ select | ←→ change | S/Esc close | H hold help | q quit "
+                ftr = " ↑↓ row | ←→ change/page | S/Esc close | H help | q quit "
             elif focus == "synth":
                 ftr = " TAB=drums | R/T/Y/P/U loop | G wav | S settings | q quit "
             else:
@@ -1824,29 +2250,69 @@ def draw(stdscr):
                 draw_help_overlay(stdscr, h, w, scope_attr, C, B, DIM)
 
             if settings_open:
-                box_w = min(48, max(30, w - 10))
-                box_h = 17
+                box_w = min(68, max(38, w - 8))
+                box_h = 18 if settings_page == 0 else 14
                 box_x = max(2, (w - box_w) // 2)
                 box_y = max(2, (h - box_h) // 2)
-                draw_box(stdscr, box_y, box_x, box_w, box_h, "SETTINGS", scope_attr|B)
-                rows = [
-                    f"Theme        {THEME_NAMES[theme]}",
-                    f"Scope source {'MIX' if scope_show_drums else 'SYNTH ONLY'}",
-                    f"Drum set     {d_bank_name}",
-                    f"Voices       {int(voices)}",
-                    f"Edit osc     OSC{active_osc + 1}",
-                    f"Waveform     {WAVEFORMS[oscillators[active_osc]['waveform']]}",
-                    f"Osc level    {int(oscillators[active_osc]['level'] * 100):3d}%",
-                    f"Osc octave   {oscillators[active_osc]['octave']:+d}",
-                    f"Osc detune   {oscillators[active_osc]['detune_cents']:+5.1f}c",
-                    f"FX warmth    {int(fx_warmth * 100):3d}%",
-                    f"FX air       {int(fx_air * 100):3d}%",
-                    f"FX reverb    {int(fx_reverb * 100):3d}%",
-                ]
+                draw_box(stdscr, box_y, box_x, box_w, box_h, f"SETTINGS {SETTINGS_PAGE_NAMES[settings_page]}", scope_attr|B)
+                tab_x = box_x + 2
+                for page_idx, page_name in enumerate(SETTINGS_PAGE_NAMES):
+                    tab_attr = (C[8]|B) if page_idx == settings_page else C[3]
+                    safe_addstr(stdscr, box_y + 1, tab_x, f" {page_name} ", tab_attr)
+                    tab_x += len(page_name) + 3
+                channel_lbl = "ALL" if midi_channel < 0 else f"CH {midi_channel + 1}"
+                current_map_lbl = midi_to_name(midi_note_map_current) if midi_note_map_current is not None else "--"
+                rows = [f"Section      {SETTINGS_PAGE_NAMES[settings_page]}"]
+                if settings_page == 0:
+                    rows.extend([
+                        f"Theme        {THEME_NAMES[theme]}",
+                        f"Scope source {'MIX' if scope_show_drums else 'SYNTH ONLY'}",
+                        f"Drum set     {d_bank_name}",
+                        f"Voices       {int(voices)}",
+                        f"Edit osc     OSC{active_osc + 1}",
+                        f"Waveform     {WAVEFORMS[oscillators[active_osc]['waveform']]}",
+                        f"Osc level    {int(oscillators[active_osc]['level'] * 100):3d}%",
+                        f"Osc octave   {oscillators[active_osc]['octave']:+d}",
+                        f"Osc detune   {oscillators[active_osc]['detune_cents']:+5.1f}c",
+                        f"FX warmth    {int(fx_warmth * 100):3d}%",
+                        f"FX air       {int(fx_air * 100):3d}%",
+                        f"FX reverb    {int(fx_reverb * 100):3d}%",
+                    ])
+                elif settings_page == 1:
+                    rows.extend([
+                        f"MIDI input   {'ON ' if midi_enabled else 'OFF'}",
+                        f"Device       {short_label(midi_device_name or 'None', 42)}",
+                        f"Refresh      {midi_device_count:2d} devices",
+                        f"Channel      {channel_lbl}",
+                        f"Keys in      {'ON ' if midi_note_input else 'OFF'}",
+                        f"Pads in      {'ON ' if midi_pad_input else 'OFF'}",
+                        f"Remap next   Go to MIDI MAP / Learn bind",
+                        f"Status       {short_label(midi_status, 42)}",
+                    ])
+                elif settings_page == 2:
+                    rows.extend([
+                        f"Source note  {midi_to_name(midi_note_edit_in):>3} ({midi_note_edit_in:03d})",
+                        f"Learn src    {'ARMED' if midi_learn_mode == 'note_src' else 'OFF'}",
+                        f"Dest note    {midi_to_name(midi_note_edit_out):>3} ({midi_note_edit_out:03d})",
+                        f"Save map     {midi_to_name(midi_note_edit_in)} → {midi_to_name(midi_note_edit_out)}",
+                        f"Clear map    {midi_to_name(midi_note_edit_in)} ({current_map_lbl})",
+                        f"Map count    {midi_note_map_count:3d}",
+                        f"Last MIDI    {short_label(midi_last_message or '--', 42)}",
+                    ])
+                else:
+                    rows.extend([
+                        f"Learn target {midi_target_label}",
+                        f"Learn bind   {'ARMED' if midi_learn_mode == 'bind' else 'OFF'}",
+                        f"Bound input  {format_binding_value(midi_target_kind, midi_target_value)}",
+                        f"Clear bind   {midi_target_label}",
+                        f"How to bind  Select target, arm Learn, move knob/hit pad",
+                        f"Last MIDI    {short_label(midi_last_message or '--', 42)}",
+                    ])
                 for idx, row_text in enumerate(rows):
                     attr = (C[8]|B) if idx == settings_cursor else C[3]
-                    safe_addstr(stdscr, box_y + 2 + idx, box_x + 2, row_text.ljust(box_w-4), attr)
-                safe_addstr(stdscr, box_y + box_h - 2, box_x + 2, "Use ←→ to change, ↑↓ to select, S/Esc to close", C[6])
+                    safe_addstr(stdscr, box_y + 3 + idx, box_x + 2, row_text.ljust(box_w-4), attr)
+                footer = "Row 1 switches page. ↑↓ select, ←→ change, Enter/Space run learn/save/clear."
+                safe_addstr(stdscr, box_y + box_h - 2, box_x + 2, footer[:box_w-4], C[6])
 
             stdscr.refresh()
             time.sleep(0.04)
@@ -1854,6 +2320,14 @@ def draw(stdscr):
     finally:
         if global_rec["recording"]:
             stop_global_recording()
+        with midi_lock:
+            midi_port = midi["input_port"]
+            midi["input_port"] = None
+        if midi_port is not None:
+            try:
+                midi_port.close()
+            except Exception:
+                pass
         stream.stop(); stream.close()
 
 curses.wrapper(draw)
@@ -1863,7 +2337,14 @@ PYEOF
 if [ ! -f "$VENV_DIR/bin/python" ]; then
   echo "First run: setting up virtual environment..."
   python3 -m venv "$VENV_DIR"
-  "$VENV_DIR/bin/pip" install --quiet numpy sounddevice
+fi
+
+if ! "$VENV_DIR/bin/python" - <<'PY' >/dev/null 2>&1
+import numpy, sounddevice, mido, rtmidi
+PY
+then
+  echo "Installing MurSynth dependencies..."
+  "$VENV_DIR/bin/pip" install --quiet numpy sounddevice mido python-rtmidi
   echo "Done! Starting synth..."
   sleep 1
 fi

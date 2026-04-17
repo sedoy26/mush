@@ -36,6 +36,7 @@ Recent work completed in `synth.sh`:
 - fixed the 32-step sequencer timing so 32 steps run at 16th-note spacing instead of doubled-speed 32nd-note spacing
 - changed global mix recording to write numbered `untiteled*.wav` files in the launch directory without overwriting older takes
 - added extra synth FX controls for warmth, air, and reverb in the settings panel
+- added paged settings support for MIDI input device selection, per-note remapping, and MIDI learn for pad/knob bindings
 
 ## Controls Added Recently
 
@@ -49,6 +50,7 @@ Recent work completed in `synth.sh`:
 - `S` opens settings, where the drum sound bank can now be changed with arrow keys
 - `G` start/stop global mix recording to a `.wav` file
 - `S` settings now also expose warmth / air / reverb amounts with arrow keys
+- `S` now opens paged settings for main synth options plus MIDI device, note map, and binding configuration
 
 ## Development Notes
 
@@ -60,6 +62,7 @@ Recent work completed in `synth.sh`:
 - Validate shell syntax with `bash -n synth.sh` after edits.
 - Validate embedded Python syntax by extracting the heredoc or otherwise checking that the generated Python compiles.
 - Avoid adding network-dependent setup changes unless explicitly needed.
+- MIDI support may require Python MIDI dependencies; keep any bootstrap install changes minimal and focused.
 
 ## Known Technical Areas To Improve
 
