@@ -75,7 +75,7 @@ CAMERA_REACTIVE_STYLES = [
     "CHROMA SPLIT",
     "MATRIX BEAT",
 ]
-SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "MIDI DEVICE", "MIDI NOTE", "MIDI MAP"]
+SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "SOUND DEVICE", "MIDI DEVICE", "MIDI NOTE", "MIDI MAP"]
 MIDI_PAD_TARGETS = [
     ("pad_kick", "Pad Kick", "note"),
     ("pad_snare", "Pad Snare", "note"),
@@ -199,6 +199,17 @@ camera_state = {
 camera_lock = threading.Lock()
 reactive_state = {"master": 0.0, "synth": 0.0, "drums": 0.0, "kick": 0.0, "snare": 0.0, "hat": 0.0, "note": 0.0}
 reactive_lock = threading.Lock()
+
+audio = {
+    "inputs": [],
+    "outputs": [],
+    "input_index": 0,
+    "output_index": 0,
+    "input_name": "",
+    "output_name": "",
+    "status": "Audio idle",
+}
+audio_lock = threading.Lock()
 
 midi = {
     "enabled": False,
@@ -1896,7 +1907,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
         safe_addstr(scr, goal_y + i, left_x + 6, line, C[6])
 
 def settings_row_count(page):
-    return [14, 7, 9, 8, 7][page]
+    return [14, 7, 7, 9, 8, 7][page]
 
 def selected_midi_bind_target_locked():
     return MIDI_BIND_TARGETS[midi["learn_target_index"]]
@@ -1906,6 +1917,109 @@ def selected_midi_binding_locked():
     if kind == "cc":
         return label, kind, midi["cc_bindings"].get(target_id)
     return label, kind, midi["note_bindings"].get(target_id)
+
+def refresh_audio_devices_locked():
+    try:
+        devices = sd.query_devices()
+        default_input, default_output = sd.default.device
+    except Exception as exc:
+        audio["inputs"] = []
+        audio["outputs"] = []
+        audio["input_index"] = 0
+        audio["output_index"] = 0
+        audio["input_name"] = ""
+        audio["output_name"] = ""
+        audio["status"] = short_label(f"Audio query failed: {exc}", 42)
+        return
+
+    inputs = []
+    outputs = []
+    for device_index, device_info in enumerate(devices):
+        device_name = short_label(str(device_info.get("name", f"Device {device_index}")).replace("\n", " ").strip(), 42)
+        if int(device_info.get("max_input_channels", 0)) > 0:
+            inputs.append({"id": device_index, "name": device_name})
+        if int(device_info.get("max_output_channels", 0)) > 0:
+            outputs.append({"id": device_index, "name": device_name})
+
+    audio["inputs"] = inputs
+    audio["outputs"] = outputs
+
+    def sync_selection(devices_list, index_key, name_key, default_device_id):
+        current_name = audio[name_key]
+        current_index = audio[index_key]
+        selected_pos = None
+        if devices_list:
+            for pos, device_info in enumerate(devices_list):
+                if current_name and device_info["name"] == current_name:
+                    selected_pos = pos
+                    break
+            if selected_pos is None:
+                for pos, device_info in enumerate(devices_list):
+                    if device_info["id"] == default_device_id:
+                        selected_pos = pos
+                        break
+            if selected_pos is None:
+                selected_pos = int(clamp(current_index, 0, len(devices_list) - 1))
+            audio[index_key] = selected_pos
+            audio[name_key] = devices_list[selected_pos]["name"]
+        else:
+            audio[index_key] = 0
+            audio[name_key] = ""
+
+    sync_selection(inputs, "input_index", "input_name", default_input)
+    sync_selection(outputs, "output_index", "output_name", default_output)
+
+    if not outputs:
+        audio["status"] = "No audio output devices"
+    else:
+        audio["status"] = f"Audio {len(outputs)} out / {len(inputs)} in"
+
+def selected_audio_input_locked():
+    if 0 <= audio["input_index"] < len(audio["inputs"]):
+        return audio["inputs"][audio["input_index"]]
+    return None
+
+def selected_audio_output_locked():
+    if 0 <= audio["output_index"] < len(audio["outputs"]):
+        return audio["outputs"][audio["output_index"]]
+    return None
+
+def open_audio_stream():
+    with audio_lock:
+        refresh_audio_devices_locked()
+        output_device = selected_audio_output_locked()
+        output_device_id = None if output_device is None else output_device["id"]
+    try:
+        stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCK_SIZE,
+            channels=2,
+            dtype='float32',
+            latency=0.2,
+            device=output_device_id,
+            callback=audio_cb,
+        )
+        stream.start()
+        with audio_lock:
+            active_name = output_device["name"] if output_device is not None else "default"
+            audio["status"] = short_label(f"Output active: {active_name}", 42)
+        return stream
+    except Exception as exc:
+        with audio_lock:
+            audio["status"] = short_label(f"Audio open failed: {exc}", 42)
+        return None
+
+def close_audio_stream(stream):
+    if stream is None:
+        return
+    try:
+        stream.stop()
+    except Exception:
+        pass
+    try:
+        stream.close()
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN DRAW LOOP
@@ -1934,9 +2048,7 @@ def draw(stdscr):
     curses.init_pair(15, curses.COLOR_BLACK,   curses.COLOR_BLUE)    # clap
     curses.init_pair(16, curses.COLOR_BLACK,   curses.COLOR_WHITE)   # tom/cym
 
-    stream = sd.OutputStream(samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE,
-                              channels=2, dtype='float32', latency=0.2, callback=audio_cb)
-    stream.start()
+    stream = open_audio_stream()
 
     last_note    = midi_to_name(60)
     held_note    = None      # tracks which note key is "down"
@@ -1953,6 +2065,9 @@ def draw(stdscr):
     drum_clear_confirm = None
     drum_notice = ""
     drum_notice_until = 0.0
+
+    with audio_lock:
+        refresh_audio_devices_locked()
 
     with midi_lock:
         refresh_midi_devices_locked()
@@ -1988,6 +2103,15 @@ def draw(stdscr):
                     if settings_page == 1:
                         pass
                     elif settings_page == 2:
+                        audio_reopen = False
+                        with audio_lock:
+                            if settings_cursor == 3:
+                                refresh_audio_devices_locked()
+                                audio_reopen = True
+                        if audio_reopen:
+                            close_audio_stream(stream)
+                            stream = open_audio_stream()
+                    elif settings_page == 3:
                         if settings_cursor == 1:
                             with midi_lock:
                                 midi["enabled"] = not midi["enabled"]
@@ -1996,7 +2120,7 @@ def draw(stdscr):
                             with midi_lock:
                                 refresh_midi_devices_locked()
                             reopen_midi_input()
-                    elif settings_page == 3:
+                    elif settings_page == 4:
                         with midi_lock:
                             if settings_cursor == 2:
                                 midi["learn_mode"] = "off" if midi["learn_mode"] == "note_src" else "note_src"
@@ -2006,7 +2130,7 @@ def draw(stdscr):
                             elif settings_cursor == 5:
                                 midi["note_map"].pop(int(midi["note_edit_in"]), None)
                                 midi["status"] = f"Cleared map for {midi_to_name(midi['note_edit_in'])}"
-                    elif settings_page == 4:
+                    elif settings_page == 5:
                         with midi_lock:
                             if settings_cursor == 2:
                                 midi["learn_mode"] = "off" if midi["learn_mode"] == "bind" else "bind"
@@ -2073,6 +2197,23 @@ def draw(stdscr):
                             elif settings_cursor == 2:
                                 ui_state["camera_reactivity"] = clamp(ui_state["camera_reactivity"] + delta * 0.05, 0.0, 1.0)
                     elif settings_page == 2:
+                        audio_reopen = False
+                        with audio_lock:
+                            if settings_cursor == 1 and audio["outputs"]:
+                                audio["output_index"] = (audio["output_index"] + delta) % len(audio["outputs"])
+                                audio["output_name"] = audio["outputs"][audio["output_index"]]["name"]
+                                audio_reopen = True
+                            elif settings_cursor == 2 and audio["inputs"]:
+                                audio["input_index"] = (audio["input_index"] + delta) % len(audio["inputs"])
+                                audio["input_name"] = audio["inputs"][audio["input_index"]]["name"]
+                                audio["status"] = short_label(f"Input selected: {audio['input_name']}", 42)
+                            elif settings_cursor == 3:
+                                refresh_audio_devices_locked()
+                                audio_reopen = True
+                        if audio_reopen:
+                            close_audio_stream(stream)
+                            stream = open_audio_stream()
+                    elif settings_page == 3:
                         midi_reopen = False
                         clear_notes = False
                         with midi_lock:
@@ -2099,7 +2240,7 @@ def draw(stdscr):
                             clear_midi_note_state()
                         if midi_reopen:
                             reopen_midi_input()
-                    elif settings_page == 3:
+                    elif settings_page == 4:
                         with midi_lock:
                             if settings_cursor == 1:
                                 midi["note_edit_in"] = int(clamp(midi["note_edit_in"] + delta, 0, 127))
@@ -2113,7 +2254,7 @@ def draw(stdscr):
                             elif settings_cursor == 5:
                                 midi["note_map"].pop(int(midi["note_edit_in"]), None)
                                 midi["status"] = f"Cleared map for {midi_to_name(midi['note_edit_in'])}"
-                    elif settings_page == 4:
+                    elif settings_page == 5:
                         with midi_lock:
                             if settings_cursor == 1:
                                 midi["learn_target_index"] = (midi["learn_target_index"] + delta) % len(MIDI_BIND_TARGETS)
@@ -2368,6 +2509,13 @@ def draw(stdscr):
                 camera_style=ui_state["camera_style"]
                 camera_reactivity=ui_state["camera_reactivity"]
                 scope_show_drums=ui_state["scope_show_drums"]
+
+            with audio_lock:
+                audio_output_name = audio["output_name"]
+                audio_input_name = audio["input_name"]
+                audio_output_count = len(audio["outputs"])
+                audio_input_count = len(audio["inputs"])
+                audio_status = audio["status"]
 
             with reactive_lock:
                 rx_master = reactive_state["master"]
@@ -2626,7 +2774,7 @@ def draw(stdscr):
 
             if settings_open:
                 box_w = min(68, max(38, w - 8))
-                box_h = 19 if settings_page == 0 else (15 if settings_page == 1 else 14)
+                box_h = 19 if settings_page == 0 else (15 if settings_page in (1, 2) else 14)
                 box_x = max(2, (w - box_w) // 2)
                 box_y = max(2, (h - box_h) // 2)
                 draw_box(stdscr, box_y, box_x, box_w, box_h, f"SETTINGS {SETTINGS_PAGE_NAMES[settings_page]}", scope_attr|B)
@@ -2665,6 +2813,15 @@ def draw(stdscr):
                     ])
                 elif settings_page == 2:
                     rows.extend([
+                        f"Output dev   {short_label(audio_output_name or 'Default', 42)}",
+                        f"Input dev    {short_label(audio_input_name or 'None', 42)}",
+                        f"Refresh      {audio_output_count:2d} out / {audio_input_count:2d} in",
+                        f"Audio in     Reserved for future input features",
+                        f"Audio stat   {short_label(audio_status, 42)}",
+                        f"How to use   Select output now, input is stored only",
+                    ])
+                elif settings_page == 3:
+                    rows.extend([
                         f"MIDI input   {'ON ' if midi_enabled else 'OFF'}",
                         f"Device       {short_label(midi_device_name or 'None', 42)}",
                         f"Refresh      {midi_device_count:2d} devices",
@@ -2674,7 +2831,7 @@ def draw(stdscr):
                         f"Remap next   Go to MIDI MAP / Learn bind",
                         f"Status       {short_label(midi_status, 42)}",
                     ])
-                elif settings_page == 3:
+                elif settings_page == 4:
                     rows.extend([
                         f"Source note  {midi_to_name(midi_note_edit_in):>3} ({midi_note_edit_in:03d})",
                         f"Learn src    {'ARMED' if midi_learn_mode == 'note_src' else 'OFF'}",
@@ -2714,7 +2871,7 @@ def draw(stdscr):
                 midi_port.close()
             except Exception:
                 pass
-        stream.stop(); stream.close()
+        close_audio_stream(stream)
 
 curses.wrapper(draw)
 PYEOF
