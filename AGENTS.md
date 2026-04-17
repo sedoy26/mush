@@ -4,7 +4,7 @@
 
 This repository currently contains a single executable script: `synth.sh`.
 
-`synth.sh` bootstraps and runs a terminal-based synthesizer called **MurSynth**. The shell script writes an embedded Python program to `$HOME/.mursynth.py`, ensures a virtualenv exists at `$HOME/.mursynth-venv`, installs `numpy` and `sounddevice` on first run, and then starts the interactive app.
+`synth.sh` bootstraps and runs a terminal-based synthesizer called **mush**. The shell script writes an embedded Python program to `$HOME/.mush.py`, ensures a virtualenv exists at `$HOME/.mush-venv`, installs `numpy` and `sounddevice` on first run, and then starts the interactive app.
 
 The Python app provides:
 
@@ -49,6 +49,7 @@ Recent work completed in `synth.sh`:
 - `Y` undo the last overdub layer
 - `P` toggle loop playback
 - `U` clear loop
+- `X` clears all drum steps with double-press confirmation while sequencer focus is active
 - `S` opens settings, where the drum sound bank can now be changed with arrow keys
 - `G` start/stop global mix recording to a `.wav` file
 - `S` settings now also expose warmth / air / reverb amounts with arrow keys
@@ -59,7 +60,7 @@ Recent work completed in `synth.sh`:
 ## Development Notes
 
 - Keep changes focused and minimal; this is a single-file project at the moment.
-- The Python source of truth is embedded inside `synth.sh`; do not edit `$HOME/.mursynth.py` directly.
+- The Python source of truth is embedded inside `synth.sh`; do not edit `$HOME/.mush.py` directly.
 - Prefer preserving the current structure unless there is a strong reason to split the embedded Python into separate files.
 - If audio behavior changes, favor fixes at the DSP/state-transition level rather than masking issues in the UI.
 - Be careful with anything that can introduce discontinuities between audio blocks; clicks usually come from abrupt state jumps, clipping, xruns, or loop boundary discontinuities.

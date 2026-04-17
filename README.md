@@ -33,8 +33,8 @@ Generated files in `wav/` and `projects/` are gitignored by default, except for 
 
 On first launch, the script creates:
 
-- `$HOME/.mursynth-venv` for Python dependencies
-- `$HOME/.mursynth.py` for the generated runtime script
+- `$HOME/.mush-venv` for Python dependencies
+- `$HOME/.mush.py` for the generated runtime script
 
 The app expects a working terminal and an available audio output device. Camera mode also expects `ffmpeg` with camera capture support.
 

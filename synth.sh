@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────
-#  MurSynth — terminal synthesizer + drums
+#  mush — terminal synthesizer + drums
 # ─────────────────────────────────────────
 
-VENV_DIR="$HOME/.mursynth-venv"
-PY_SCRIPT="$HOME/.mursynth.py"
+VENV_DIR="$HOME/.mush-venv"
+PY_SCRIPT="$HOME/.mush.py"
 
 cat > "$PY_SCRIPT" << 'PYEOF'
 import curses, numpy as np, sounddevice as sd
@@ -51,7 +51,7 @@ CAMERA_CAPTURE_FPS = 30
 CAMERA_OUTPUT_FPS = 12
 CAMERA_FRAME_WIDTH = 160
 CAMERA_FRAME_HEIGHT = 90
-CAMERA_DEVICE = os.environ.get("MURSYNTH_CAMERA_DEVICE", "0")
+CAMERA_DEVICE = os.environ.get("MUSH_CAMERA_DEVICE", "0")
 INPUT_POLL_MS = 16
 ESC_KEY_DELAY_MS = 25
 
@@ -1850,7 +1850,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
     inner_w = box_w - 4
     left_x = box_x + 3
 
-    draw_box(scr, box_y, box_x, box_w, box_h, "MURSYNTH HELP", scope_attr|B)
+    draw_box(scr, box_y, box_x, box_w, box_h, "MUSH HELP", scope_attr|B)
     safe_addstr(scr, box_y + 1, left_x, "Terminal synth + drums + looper", C[3]|B)
     if box_w >= 72:
         safe_addstr(scr, box_y + 1, box_x + box_w - 28, "Hold H to keep this visible", C[6])
@@ -2846,7 +2846,7 @@ def draw(stdscr):
 
             # ── header ─────────────────────────────
             foc_ind = " [SYNTH] " if focus=="synth" else " [DRUM]  "
-            safe_addstr(stdscr, 0, 0, "  ♪  MurSynth  ♪  ".center(w), C[1]|B)
+            safe_addstr(stdscr, 0, 0, "  ♪  mush  ♪  ".center(w), C[1]|B)
             btn_attr = (scope_attr|B) if settings_open else C[3]
             help_attr = (scope_attr|B) if show_help else C[3]
             safe_addstr(stdscr, 0, max(2, w-31), "[SET S]", btn_attr)
@@ -3166,7 +3166,7 @@ if ! "$VENV_DIR/bin/python" - <<'PY' >/dev/null 2>&1
 import numpy, sounddevice, mido, rtmidi
 PY
 then
-  echo "Installing MurSynth dependencies..."
+  echo "Installing mush dependencies..."
   "$VENV_DIR/bin/pip" install --quiet numpy sounddevice mido python-rtmidi
   echo "Done! Starting synth..."
   sleep 1
