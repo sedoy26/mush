@@ -29,6 +29,13 @@ Recent work completed in `synth.sh`:
 - added a small loop recorder with record, overdub, play, and clear controls
 - updated UI/help/settings to expose oscillator editing and loop status
 - added basic xrun counter visibility in the UI for debugging audio stability
+- added 10 selectable vintage-style drum sound banks for the sequencer settings panel
+- expanded the drum machine to 6 instruments and 32 steps
+- added loop overdub undo for stepping back the last recorded layer
+- added global mix recording that writes `.wav` files when stopped
+- fixed the 32-step sequencer timing so 32 steps run at 16th-note spacing instead of doubled-speed 32nd-note spacing
+- changed global mix recording to write numbered `untiteled*.wav` files in the launch directory without overwriting older takes
+- added extra synth FX controls for warmth, air, and reverb in the settings panel
 
 ## Controls Added Recently
 
@@ -36,8 +43,12 @@ Recent work completed in `synth.sh`:
 - `z` / `x` change waveform of selected oscillator
 - `R` start/stop loop record (replace)
 - `T` overdub into existing loop
+- `Y` undo the last overdub layer
 - `P` toggle loop playback
 - `U` clear loop
+- `S` opens settings, where the drum sound bank can now be changed with arrow keys
+- `G` start/stop global mix recording to a `.wav` file
+- `S` settings now also expose warmth / air / reverb amounts with arrow keys
 
 ## Development Notes
 

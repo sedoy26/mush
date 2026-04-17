@@ -8,7 +8,7 @@ PY_SCRIPT="$HOME/.mursynth.py"
 
 cat > "$PY_SCRIPT" << 'PYEOF'
 import curses, numpy as np, sounddevice as sd
-import threading, time, textwrap
+import os, threading, time, textwrap, wave
 from collections import deque
 
 SAMPLE_RATE   = 44100
@@ -33,6 +33,8 @@ LOOP_PLAY_SMOOTH_TIME = 0.012
 MASTER_LIMIT_THRESHOLD = 0.74
 MASTER_LIMIT_ATTACK = 0.002
 MASTER_LIMIT_RELEASE = 0.08
+LOOP_UNDO_LIMIT = 12
+GLOBAL_REC_FILENAME = "untiteled.wav"
 
 KEYBOARD_OFFSETS = {
     ord('a'):0,  ord('w'):1,  ord('s'):2,  ord('e'):3,
@@ -83,6 +85,12 @@ synth = {
     "fx_delay_time": 0.25,
     "fx_delay_time_current": 0.25,
     "fx_drive_current": 0.0,
+    "fx_warmth": 0.0,
+    "fx_warmth_current": 0.0,
+    "fx_air": 0.0,
+    "fx_air_current": 0.0,
+    "fx_reverb": 0.0,
+    "fx_reverb_current": 0.0,
     "filter_mix": 0.0,
     "filt_z": 0.0, "filt_z2": 0.0,
     "last_output": 0.0,
@@ -100,8 +108,17 @@ loop = {
     "overdub": False,
     "has_audio": False,
     "play_gain": 0.0,
+    "undo_stack": [],
 }
 loop_lock = threading.Lock()
+
+global_rec = {
+    "recording": False,
+    "chunks": [],
+    "last_path": "",
+    "last_error": "",
+}
+global_rec_lock = threading.Lock()
 
 ui_state = {
     "theme": 0,
@@ -112,17 +129,139 @@ ui_lock = threading.Lock()
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DRUM STATE
 # ═══════════════════════════════════════════════════════════════════════════════
-DRUM_NAMES  = ["KICK", "SNRE", "HIHT", "TOPP"]
+DRUM_NAMES  = ["KICK", "SNRE", "CLAP", "HIHT", "TOM ", "CYMB"]
 DRUM_COLORS = [3, 4, 5, 6]   # colour pair indices per voice
-NUM_STEPS   = 16
+NUM_DRUM_VOICES = len(DRUM_NAMES)
+NUM_STEPS   = 32
+
+DRUM_BANKS = [
+    {
+        "name": "TR-808",
+        "lengths": [int(0.62 * SAMPLE_RATE), int(0.20 * SAMPLE_RATE), int(0.07 * SAMPLE_RATE), int(0.38 * SAMPLE_RATE)],
+        "kick": {"base": 38.0, "sweep": 122.0, "pitch_decay": 0.09, "amp_decay": 0.48, "click": 0.05, "click_decay": 0.004},
+        "snare": {"tone1": 185.0, "tone2": 330.0, "tone_mix": 0.34, "noise_mix": 0.66, "tone_decay": 0.16, "noise_decay": 0.11, "hp_freq": 1900.0},
+        "hihat": {"decay": 0.045, "hp_freq": 9000.0, "noise_mix": 0.72, "metal_mix": 0.28, "metal_freqs": [4020.0, 5220.0, 6460.0, 8120.0, 9300.0, 10500.0]},
+        "top": {"decay": 0.30, "hp_freq": 6400.0, "noise_mix": 0.78, "metal_mix": 0.22, "metal_freqs": [3180.0, 4140.0, 5300.0, 6680.0, 7940.0, 9460.0]},
+    },
+    {
+        "name": "TR-909",
+        "lengths": [int(0.46 * SAMPLE_RATE), int(0.16 * SAMPLE_RATE), int(0.06 * SAMPLE_RATE), int(0.24 * SAMPLE_RATE)],
+        "kick": {"base": 52.0, "sweep": 146.0, "pitch_decay": 0.06, "amp_decay": 0.34, "click": 0.11, "click_decay": 0.003},
+        "snare": {"tone1": 228.0, "tone2": 342.0, "tone_mix": 0.42, "noise_mix": 0.58, "tone_decay": 0.12, "noise_decay": 0.09, "hp_freq": 2500.0},
+        "hihat": {"decay": 0.035, "hp_freq": 9800.0, "noise_mix": 0.48, "metal_mix": 0.52, "metal_freqs": [4180.0, 5480.0, 6420.0, 8360.0, 9340.0, 11020.0]},
+        "top": {"decay": 0.18, "hp_freq": 7200.0, "noise_mix": 0.44, "metal_mix": 0.56, "metal_freqs": [3320.0, 4280.0, 5840.0, 7140.0, 8620.0, 10300.0]},
+    },
+    {
+        "name": "CR-78",
+        "lengths": [int(0.36 * SAMPLE_RATE), int(0.15 * SAMPLE_RATE), int(0.05 * SAMPLE_RATE), int(0.22 * SAMPLE_RATE)],
+        "kick": {"base": 64.0, "sweep": 82.0, "pitch_decay": 0.05, "amp_decay": 0.22, "click": 0.03, "click_decay": 0.003},
+        "snare": {"tone1": 240.0, "tone2": 480.0, "tone_mix": 0.52, "noise_mix": 0.48, "tone_decay": 0.10, "noise_decay": 0.08, "hp_freq": 1800.0},
+        "hihat": {"decay": 0.028, "hp_freq": 8200.0, "noise_mix": 0.84, "metal_mix": 0.16, "metal_freqs": [3640.0, 4980.0, 6420.0, 7980.0, 9100.0, 10080.0]},
+        "top": {"decay": 0.14, "hp_freq": 5800.0, "noise_mix": 0.86, "metal_mix": 0.14, "metal_freqs": [3020.0, 3940.0, 4820.0, 6020.0, 7360.0, 8920.0]},
+    },
+    {
+        "name": "LinnDrum",
+        "lengths": [int(0.34 * SAMPLE_RATE), int(0.16 * SAMPLE_RATE), int(0.06 * SAMPLE_RATE), int(0.18 * SAMPLE_RATE)],
+        "kick": {"base": 58.0, "sweep": 96.0, "pitch_decay": 0.045, "amp_decay": 0.24, "click": 0.08, "click_decay": 0.003},
+        "snare": {"tone1": 198.0, "tone2": 286.0, "tone_mix": 0.46, "noise_mix": 0.54, "tone_decay": 0.11, "noise_decay": 0.09, "hp_freq": 2200.0},
+        "hihat": {"decay": 0.038, "hp_freq": 9400.0, "noise_mix": 0.76, "metal_mix": 0.24, "metal_freqs": [4280.0, 5260.0, 6120.0, 7360.0, 8640.0, 9560.0]},
+        "top": {"decay": 0.15, "hp_freq": 6800.0, "noise_mix": 0.74, "metal_mix": 0.26, "metal_freqs": [3160.0, 4180.0, 5120.0, 6340.0, 7820.0, 9140.0]},
+    },
+    {
+        "name": "DMX",
+        "lengths": [int(0.38 * SAMPLE_RATE), int(0.17 * SAMPLE_RATE), int(0.06 * SAMPLE_RATE), int(0.18 * SAMPLE_RATE)],
+        "kick": {"base": 49.0, "sweep": 110.0, "pitch_decay": 0.05, "amp_decay": 0.28, "click": 0.09, "click_decay": 0.003},
+        "snare": {"tone1": 210.0, "tone2": 300.0, "tone_mix": 0.40, "noise_mix": 0.60, "tone_decay": 0.11, "noise_decay": 0.09, "hp_freq": 2400.0},
+        "hihat": {"decay": 0.03, "hp_freq": 9800.0, "noise_mix": 0.79, "metal_mix": 0.21, "metal_freqs": [4520.0, 5600.0, 6480.0, 7740.0, 8980.0, 10140.0]},
+        "top": {"decay": 0.16, "hp_freq": 7000.0, "noise_mix": 0.78, "metal_mix": 0.22, "metal_freqs": [3340.0, 4260.0, 5480.0, 6740.0, 8120.0, 9440.0]},
+    },
+    {
+        "name": "DrumTraks",
+        "lengths": [int(0.36 * SAMPLE_RATE), int(0.16 * SAMPLE_RATE), int(0.06 * SAMPLE_RATE), int(0.16 * SAMPLE_RATE)],
+        "kick": {"base": 54.0, "sweep": 92.0, "pitch_decay": 0.05, "amp_decay": 0.26, "click": 0.07, "click_decay": 0.003},
+        "snare": {"tone1": 224.0, "tone2": 312.0, "tone_mix": 0.38, "noise_mix": 0.62, "tone_decay": 0.10, "noise_decay": 0.08, "hp_freq": 2600.0},
+        "hihat": {"decay": 0.03, "hp_freq": 10100.0, "noise_mix": 0.70, "metal_mix": 0.30, "metal_freqs": [4340.0, 5440.0, 6300.0, 7540.0, 8860.0, 10340.0]},
+        "top": {"decay": 0.14, "hp_freq": 7200.0, "noise_mix": 0.68, "metal_mix": 0.32, "metal_freqs": [3240.0, 4320.0, 5480.0, 6740.0, 8260.0, 9680.0]},
+    },
+    {
+        "name": "Simmons",
+        "lengths": [int(0.44 * SAMPLE_RATE), int(0.20 * SAMPLE_RATE), int(0.08 * SAMPLE_RATE), int(0.22 * SAMPLE_RATE)],
+        "kick": {"base": 46.0, "sweep": 168.0, "pitch_decay": 0.08, "amp_decay": 0.30, "click": 0.02, "click_decay": 0.003},
+        "snare": {"tone1": 278.0, "tone2": 418.0, "tone_mix": 0.66, "noise_mix": 0.34, "tone_decay": 0.14, "noise_decay": 0.08, "hp_freq": 2800.0},
+        "hihat": {"decay": 0.05, "hp_freq": 8800.0, "noise_mix": 0.34, "metal_mix": 0.66, "metal_freqs": [2820.0, 3560.0, 4720.0, 6040.0, 7440.0, 8920.0]},
+        "top": {"decay": 0.22, "hp_freq": 6400.0, "noise_mix": 0.30, "metal_mix": 0.70, "metal_freqs": [2340.0, 3140.0, 4260.0, 5480.0, 6920.0, 8400.0]},
+    },
+    {
+        "name": "RX11",
+        "lengths": [int(0.32 * SAMPLE_RATE), int(0.15 * SAMPLE_RATE), int(0.05 * SAMPLE_RATE), int(0.15 * SAMPLE_RATE)],
+        "kick": {"base": 60.0, "sweep": 88.0, "pitch_decay": 0.04, "amp_decay": 0.22, "click": 0.08, "click_decay": 0.0025},
+        "snare": {"tone1": 236.0, "tone2": 330.0, "tone_mix": 0.36, "noise_mix": 0.64, "tone_decay": 0.09, "noise_decay": 0.07, "hp_freq": 2900.0},
+        "hihat": {"decay": 0.025, "hp_freq": 10400.0, "noise_mix": 0.74, "metal_mix": 0.26, "metal_freqs": [4680.0, 5720.0, 6640.0, 7860.0, 9180.0, 10560.0]},
+        "top": {"decay": 0.12, "hp_freq": 7600.0, "noise_mix": 0.70, "metal_mix": 0.30, "metal_freqs": [3460.0, 4460.0, 5640.0, 6920.0, 8420.0, 9840.0]},
+    },
+    {
+        "name": "R-8",
+        "lengths": [int(0.40 * SAMPLE_RATE), int(0.18 * SAMPLE_RATE), int(0.07 * SAMPLE_RATE), int(0.24 * SAMPLE_RATE)],
+        "kick": {"base": 50.0, "sweep": 118.0, "pitch_decay": 0.055, "amp_decay": 0.28, "click": 0.07, "click_decay": 0.003},
+        "snare": {"tone1": 212.0, "tone2": 324.0, "tone_mix": 0.44, "noise_mix": 0.56, "tone_decay": 0.11, "noise_decay": 0.08, "hp_freq": 2600.0},
+        "hihat": {"decay": 0.036, "hp_freq": 9800.0, "noise_mix": 0.62, "metal_mix": 0.38, "metal_freqs": [4180.0, 5160.0, 6280.0, 7580.0, 8980.0, 10440.0]},
+        "top": {"decay": 0.18, "hp_freq": 7200.0, "noise_mix": 0.60, "metal_mix": 0.40, "metal_freqs": [3260.0, 4320.0, 5520.0, 6840.0, 8340.0, 9880.0]},
+    },
+    {
+        "name": "SP12",
+        "lengths": [int(0.42 * SAMPLE_RATE), int(0.18 * SAMPLE_RATE), int(0.06 * SAMPLE_RATE), int(0.20 * SAMPLE_RATE)],
+        "kick": {"base": 48.0, "sweep": 104.0, "pitch_decay": 0.05, "amp_decay": 0.30, "click": 0.06, "click_decay": 0.003},
+        "snare": {"tone1": 204.0, "tone2": 296.0, "tone_mix": 0.40, "noise_mix": 0.60, "tone_decay": 0.11, "noise_decay": 0.09, "hp_freq": 2300.0},
+        "hihat": {"decay": 0.032, "hp_freq": 9400.0, "noise_mix": 0.80, "metal_mix": 0.20, "metal_freqs": [4120.0, 5180.0, 6200.0, 7420.0, 8640.0, 9780.0]},
+        "top": {"decay": 0.17, "hp_freq": 6900.0, "noise_mix": 0.78, "metal_mix": 0.22, "metal_freqs": [3180.0, 4220.0, 5340.0, 6620.0, 8040.0, 9480.0]},
+    },
+]
+
+def enrich_drum_bank(bank):
+    kick = bank["kick"]
+    snare = bank["snare"]
+    hihat = bank["hihat"]
+    cymb = bank["top"]
+    clap = {
+        "bursts": [0.0, 0.011, 0.023],
+        "burst_decay": max(0.015, snare["noise_decay"] * 0.45),
+        "decay": max(0.05, snare["noise_decay"] * 0.8),
+        "hp_freq": snare["hp_freq"] * 1.35,
+        "noise_mix": min(0.9, snare["noise_mix"] + 0.12),
+        "tone_mix": max(0.08, snare["tone_mix"] * 0.45),
+        "tone_freq": snare["tone2"] * 1.15,
+    }
+    tom = {
+        "base": kick["base"] * 2.4,
+        "sweep": kick["sweep"] * 0.45,
+        "pitch_decay": max(0.04, kick["pitch_decay"] * 1.15),
+        "amp_decay": max(0.11, kick["amp_decay"] * 0.52),
+        "tone2": snare["tone1"] * 0.8,
+        "tone_mix": 0.3,
+    }
+    bank["clap"] = clap
+    bank["tom"] = tom
+    bank["cymb"] = cymb
+    bank["lengths"] = [
+        bank["lengths"][0],
+        bank["lengths"][1],
+        int(max(0.08, snare["noise_decay"] * 1.4) * SAMPLE_RATE),
+        bank["lengths"][2],
+        int(max(0.14, kick["amp_decay"] * 0.6) * SAMPLE_RATE),
+        bank["lengths"][3],
+    ]
+    return bank
+
+DRUM_BANKS = [enrich_drum_bank(bank) for bank in DRUM_BANKS]
 
 drum = {
-    "steps":    [[False]*NUM_STEPS for _ in range(4)],   # [voice][step]
-    "vol":      [0.8, 0.7, 0.6, 0.65],
+    "steps":    [[False]*NUM_STEPS for _ in range(NUM_DRUM_VOICES)],   # [voice][step]
+    "vol":      [0.8, 0.7, 0.65, 0.6, 0.62, 0.65],
     "running":  False,
     "bpm":      120.0,
+    "bank":     0,
     "cur_step": 0,
-    "trig":     [False]*4,   # one-shot trigger flags set by sequencer thread
+    "trig":     [False]*NUM_DRUM_VOICES,   # one-shot trigger flags set by sequencer thread
 }
 drum_lock = threading.Lock()
 
@@ -157,6 +296,9 @@ def current_play_freq_locked():
 def active_osc_locked():
     return synth["oscillators"][synth["active_osc"]]
 
+def current_drum_bank_locked():
+    return DRUM_BANKS[drum["bank"]]
+
 noise_rng = np.random.default_rng()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -164,12 +306,10 @@ noise_rng = np.random.default_rng()
 # ═══════════════════════════════════════════════════════════════════════════════
 # Per-voice state for synthesis (running phase/filter per voice)
 drum_voice = [
-    {"phase": 0.0, "fz": 0.0, "fz2": 0.0, "t": 0, "last_output": 0.0, "declick_from": 0.0, "declick_pos": 0},   # kick
-    {"phase": 0.0, "fz": 0.0, "fz2": 0.0, "t": 0, "last_output": 0.0, "declick_from": 0.0, "declick_pos": 0},   # snare
-    {"phase": 0.0, "fz": 0.0, "fz2": 0.0, "t": 0, "last_output": 0.0, "declick_from": 0.0, "declick_pos": 0},   # hihat
-    {"phase": 0.0, "fz": 0.0, "fz2": 0.0, "t": 0, "last_output": 0.0, "declick_from": 0.0, "declick_pos": 0},   # top
+    {"phase": 0.0, "fz": 0.0, "fz2": 0.0, "t": 0, "last_output": 0.0, "declick_from": 0.0, "declick_pos": 0, "aux_phases": [0.0]*6}
+    for _ in range(NUM_DRUM_VOICES)
 ]
-drum_trig_sample = [-1]*4   # sample index when each voice was triggered (-1=off)
+drum_trig_sample = [-1]*NUM_DRUM_VOICES   # sample index when each voice was triggered (-1=off)
 
 DRUM_ATTACK_SAMPLES = max(1, int(DRUM_ATTACK_TIME * SAMPLE_RATE))
 DRUM_RETRIG_DECLICK_SAMPLES = max(1, int(DRUM_RETRIG_DECLICK_TIME * SAMPLE_RATE))
@@ -183,6 +323,21 @@ def reset_drum_voice(voice_idx):
     dv["fz"] = 0.0
     dv["fz2"] = 0.0
     dv["t"] = 0
+    dv["aux_phases"] = [0.0] * len(dv["aux_phases"])
+
+def metallic_cluster(dv, freqs, frames):
+    if frames <= 0 or not freqs:
+        return np.zeros(frames, dtype=np.float32)
+    out = np.zeros(frames, dtype=np.float32)
+    phases = dv["aux_phases"]
+    count = min(len(phases), len(freqs))
+    time_steps = np.arange(frames, dtype=np.float32) + 1.0
+    for idx in range(count):
+        phase = phases[idx] + time_steps * (float(freqs[idx]) / SAMPLE_RATE)
+        phases[idx] = float(phase[-1] % 1.0)
+        out += np.where(np.remainder(phase, 1.0) < 0.5, 1.0, -1.0).astype(np.float32, copy=False)
+    out /= max(1, count)
+    return out
 
 def apply_drum_attack(signal, t_samp):
     remaining = DRUM_ATTACK_SAMPLES - int(t_samp)
@@ -193,7 +348,7 @@ def apply_drum_attack(signal, t_samp):
     signal[:fade] *= np.clip(ramp, 0.0, 1.0)
     return signal
 
-def finalize_drum_chunk(signal, voice_idx, t_samp):
+def finalize_drum_chunk(signal, voice_idx, t_samp, length_samples):
     out = apply_drum_attack(signal.astype(np.float32, copy=False), t_samp)
     dv = drum_voice[voice_idx]
     remaining = DRUM_RETRIG_DECLICK_SAMPLES - dv["declick_pos"]
@@ -205,75 +360,120 @@ def finalize_drum_chunk(signal, voice_idx, t_samp):
         if dv["declick_pos"] >= DRUM_RETRIG_DECLICK_SAMPLES:
             dv["declick_from"] = 0.0
     if len(out) > 0:
-        samples_left = DRUM_LENGTHS[voice_idx] - (t_samp + np.arange(len(out), dtype=np.float32) + 1.0)
+        samples_left = length_samples - (t_samp + np.arange(len(out), dtype=np.float32) + 1.0)
         tail_gain = np.clip(samples_left / float(DRUM_END_FADE_SAMPLES), 0.0, 1.0)
         out *= tail_gain
     if len(out) > 0:
         dv["last_output"] = float(out[-1])
     return out
 
-def drum_synth_kick(t_samp, frames):
-    """808 kick: sine with fast pitch drop + exponential decay."""
+def drum_synth_kick(bank, t_samp, frames):
     if frames <= 0:
         return np.zeros(0, dtype=np.float32)
+    params = bank["kick"]
     dv  = drum_voice[0]
     age = t_samp + np.arange(frames, dtype=np.float32)
-    freq = 40.0 + 120.0 * np.exp(-age / (0.08 * SAMPLE_RATE))
-    amp = np.exp(-age / (0.45 * SAMPLE_RATE))
+    freq = params["base"] + params["sweep"] * np.exp(-age / max(1.0, params["pitch_decay"] * SAMPLE_RATE))
+    amp = np.exp(-age / max(1.0, params["amp_decay"] * SAMPLE_RATE))
     phase = dv["phase"] + np.cumsum(freq / SAMPLE_RATE, dtype=np.float32)
     dv["phase"] = float(phase[-1] % 1.0)
-    out = np.sin(2*np.pi*phase) * amp
-    return finalize_drum_chunk(out, 0, t_samp)
+    body = np.sin(2*np.pi*phase)
+    click_env = np.exp(-age / max(1.0, params["click_decay"] * SAMPLE_RATE))
+    click = noise_rng.uniform(-1.0, 1.0, frames).astype(np.float32) * click_env
+    out = (body * (1.0 - params["click"]) + click * params["click"]) * amp
+    return finalize_drum_chunk(out, 0, t_samp, bank["lengths"][0])
 
-def drum_synth_snare(t_samp, frames):
-    """909 snare: pitched tone + noise burst, short decay."""
+def drum_synth_snare(bank, t_samp, frames):
     if frames <= 0:
         return np.zeros(0, dtype=np.float32)
+    params = bank["snare"]
     dv  = drum_voice[1]
     age = t_samp + np.arange(frames, dtype=np.float32)
-    amp = np.exp(-age / (0.12 * SAMPLE_RATE))
-    phase = dv["phase"] + ((np.arange(frames, dtype=np.float32) + 1.0) * (220.0 / SAMPLE_RATE))
-    dv["phase"] = float(phase[-1] % 1.0)
-    tone = np.sin(2*np.pi*phase) * 0.5
-    noise = noise_rng.uniform(-0.5, 0.5, frames).astype(np.float32)
-    out = (tone + noise) * amp
-    return finalize_drum_chunk(out, 1, t_samp)
-
-def drum_synth_hihat(t_samp, frames):
-    """Closed hihat: filtered noise, very short."""
-    out = np.zeros(frames, dtype=np.float32)
-    dv  = drum_voice[2]
-    c   = np.exp(-2*np.pi * 8000.0 / SAMPLE_RATE)   # hi-pass-ish
+    time_steps = np.arange(frames, dtype=np.float32) + 1.0
+    phase1 = dv["phase"] + time_steps * (params["tone1"] / SAMPLE_RATE)
+    phase2 = dv["aux_phases"][0] + time_steps * (params["tone2"] / SAMPLE_RATE)
+    dv["phase"] = float(phase1[-1] % 1.0)
+    dv["aux_phases"][0] = float(phase2[-1] % 1.0)
+    tone_env = np.exp(-age / max(1.0, params["tone_decay"] * SAMPLE_RATE))
+    noise_env = np.exp(-age / max(1.0, params["noise_decay"] * SAMPLE_RATE))
+    tone = (np.sin(2*np.pi*phase1) * 0.65 + np.sin(2*np.pi*phase2) * 0.35) * tone_env
+    hp_coeff = np.exp(-2*np.pi * params["hp_freq"] / SAMPLE_RATE)
     noise = noise_rng.uniform(-1.0, 1.0, frames).astype(np.float32)
-    for i in range(frames):
-        age   = t_samp + i
-        amp   = np.exp(-age / (0.04 * SAMPLE_RATE))
-        sample = noise[i]
-        dv["fz"] = dv["fz"] * c + sample * (1-c)
-        out[i] = (sample - dv["fz"]) * amp  # high-pass
-    return finalize_drum_chunk(out, 2, t_samp)
+    hp_noise = np.empty(frames, dtype=np.float32)
+    for i, sample in enumerate(noise):
+        dv["fz"] = dv["fz"] * hp_coeff + sample * (1.0 - hp_coeff)
+        hp_noise[i] = sample - dv["fz"]
+    out = tone * params["tone_mix"] + hp_noise * noise_env * params["noise_mix"]
+    return finalize_drum_chunk(out, 1, t_samp, bank["lengths"][1])
 
-def drum_synth_top(t_samp, frames):
-    """Open top / cymbal: longer filtered noise."""
+def drum_synth_hihat(bank, t_samp, frames):
     out = np.zeros(frames, dtype=np.float32)
+    params = bank["hihat"]
     dv  = drum_voice[3]
-    c   = np.exp(-2*np.pi * 6000.0 / SAMPLE_RATE)
+    c   = np.exp(-2*np.pi * params["hp_freq"] / SAMPLE_RATE)
     noise = noise_rng.uniform(-1.0, 1.0, frames).astype(np.float32)
+    metal = metallic_cluster(dv, params["metal_freqs"], frames)
     for i in range(frames):
         age   = t_samp + i
-        amp   = np.exp(-age / (0.25 * SAMPLE_RATE))
+        amp   = np.exp(-age / max(1.0, params["decay"] * SAMPLE_RATE))
         sample = noise[i]
-        dv["fz"] = dv["fz"] * c + sample * (1-c)
-        out[i] = (sample - dv["fz"]) * amp
-    return finalize_drum_chunk(out, 3, t_samp)
+        dv["fz"] = dv["fz"] * c + sample * (1.0-c)
+        out[i] = ((sample - dv["fz"]) * params["noise_mix"] + metal[i] * params["metal_mix"]) * amp
+    return finalize_drum_chunk(out, 3, t_samp, bank["lengths"][3])
 
-DRUM_SYNTHS  = [drum_synth_kick, drum_synth_snare, drum_synth_hihat, drum_synth_top]
-DRUM_LENGTHS = [
-    int(0.6  * SAMPLE_RATE),   # kick   ~600ms
-    int(0.18 * SAMPLE_RATE),   # snare  ~180ms
-    int(0.07 * SAMPLE_RATE),   # hihat   ~70ms
-    int(0.35 * SAMPLE_RATE),   # top    ~350ms
-]
+def drum_synth_clap(bank, t_samp, frames):
+    out = np.zeros(frames, dtype=np.float32)
+    params = bank["clap"]
+    dv  = drum_voice[2]
+    c   = np.exp(-2*np.pi * params["hp_freq"] / SAMPLE_RATE)
+    noise = noise_rng.uniform(-1.0, 1.0, frames).astype(np.float32)
+    phase = dv["phase"] + (np.arange(frames, dtype=np.float32) + 1.0) * (params["tone_freq"] / SAMPLE_RATE)
+    dv["phase"] = float(phase[-1] % 1.0) if frames > 0 else dv["phase"]
+    tone = np.sin(2.0 * np.pi * phase).astype(np.float32, copy=False)
+    for i in range(frames):
+        age   = t_samp + i
+        sample = noise[i]
+        dv["fz"] = dv["fz"] * c + sample * (1.0-c)
+        burst_env = 0.0
+        for burst in params["bursts"]:
+            if age >= burst * SAMPLE_RATE:
+                burst_env += np.exp(-(age - burst * SAMPLE_RATE) / max(1.0, params["burst_decay"] * SAMPLE_RATE))
+        amp = burst_env * np.exp(-age / max(1.0, params["decay"] * SAMPLE_RATE))
+        out[i] = ((sample - dv["fz"]) * params["noise_mix"] + tone[i] * params["tone_mix"]) * amp
+    return finalize_drum_chunk(out, 2, t_samp, bank["lengths"][2])
+
+def drum_synth_tom(bank, t_samp, frames):
+    if frames <= 0:
+        return np.zeros(0, dtype=np.float32)
+    params = bank["tom"]
+    dv = drum_voice[4]
+    age = t_samp + np.arange(frames, dtype=np.float32)
+    freq = params["base"] + params["sweep"] * np.exp(-age / max(1.0, params["pitch_decay"] * SAMPLE_RATE))
+    amp = np.exp(-age / max(1.0, params["amp_decay"] * SAMPLE_RATE))
+    phase1 = dv["phase"] + np.cumsum(freq / SAMPLE_RATE, dtype=np.float32)
+    phase2 = dv["aux_phases"][0] + np.cumsum((freq * 1.5) / SAMPLE_RATE, dtype=np.float32)
+    dv["phase"] = float(phase1[-1] % 1.0)
+    dv["aux_phases"][0] = float(phase2[-1] % 1.0)
+    body = np.sin(2*np.pi*phase1) * (1.0 - params["tone_mix"]) + np.sin(2*np.pi*phase2) * params["tone_mix"]
+    out = body * amp
+    return finalize_drum_chunk(out, 4, t_samp, bank["lengths"][4])
+
+def drum_synth_cymb(bank, t_samp, frames):
+    out = np.zeros(frames, dtype=np.float32)
+    params = bank["cymb"]
+    dv  = drum_voice[5]
+    c   = np.exp(-2*np.pi * params["hp_freq"] / SAMPLE_RATE)
+    noise = noise_rng.uniform(-1.0, 1.0, frames).astype(np.float32)
+    metal = metallic_cluster(dv, params["metal_freqs"], frames)
+    for i in range(frames):
+        age   = t_samp + i
+        amp   = np.exp(-age / max(1.0, params["decay"] * SAMPLE_RATE))
+        sample = noise[i]
+        dv["fz"] = dv["fz"] * c + sample * (1.0-c)
+        out[i] = ((sample - dv["fz"]) * params["noise_mix"] + metal[i] * params["metal_mix"]) * amp
+    return finalize_drum_chunk(out, 5, t_samp, bank["lengths"][5])
+
+DRUM_SYNTHS  = [drum_synth_kick, drum_synth_snare, drum_synth_clap, drum_synth_hihat, drum_synth_tom, drum_synth_cymb]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SYNTH DSP
@@ -390,6 +590,94 @@ def finalize_loop_edges_locked():
         return
     ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
     loop["buffer"][:fade] *= ramp
+
+def clear_loop_locked():
+    loop["buffer"].fill(0.0)
+    loop["length"] = 0
+    loop["write_pos"] = 0
+    loop["read_pos"] = 0
+    loop["recording"] = False
+    loop["playing"] = False
+    loop["overdub"] = False
+    loop["has_audio"] = False
+    loop["play_gain"] = 0.0
+    loop["undo_stack"].clear()
+
+def push_loop_undo_locked():
+    if not loop["has_audio"] or loop["length"] <= 0:
+        return
+    loop["undo_stack"].append({
+        "buffer": loop["buffer"][:loop["length"]].copy(),
+        "length": int(loop["length"]),
+    })
+    if len(loop["undo_stack"]) > LOOP_UNDO_LIMIT:
+        loop["undo_stack"] = loop["undo_stack"][-LOOP_UNDO_LIMIT:]
+
+def undo_last_overdub():
+    with loop_lock:
+        if loop["recording"] or not loop["undo_stack"]:
+            return False
+        snap = loop["undo_stack"].pop()
+        undo_stack = list(loop["undo_stack"])
+        clear_loop_locked()
+        loop["undo_stack"] = undo_stack
+        loop["length"] = snap["length"]
+        if loop["length"] > 0:
+            loop["buffer"][:loop["length"]] = snap["buffer"]
+            loop["has_audio"] = True
+            loop["playing"] = True
+        return True
+
+def start_global_recording():
+    with global_rec_lock:
+        global_rec["recording"] = True
+        global_rec["chunks"] = []
+        global_rec["last_error"] = ""
+        global_rec["last_path"] = ""
+
+def next_global_recording_path():
+    base, ext = os.path.splitext(GLOBAL_REC_FILENAME)
+    path = os.path.join(os.getcwd(), GLOBAL_REC_FILENAME)
+    if not os.path.exists(path):
+        return path
+
+    idx = 1
+    while True:
+        candidate = os.path.join(os.getcwd(), f"{base}-{idx:04d}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
+
+def stop_global_recording():
+    with global_rec_lock:
+        if not global_rec["recording"]:
+            return global_rec["last_path"], global_rec["last_error"]
+        global_rec["recording"] = False
+        chunks = global_rec["chunks"]
+        global_rec["chunks"] = []
+    if not chunks:
+        with global_rec_lock:
+            global_rec["last_error"] = "No audio captured"
+        return "", "No audio captured"
+    try:
+        path = next_global_recording_path()
+        mono = np.concatenate(chunks).astype(np.float32, copy=False)
+        pcm = np.clip(mono, -0.999, 0.999)
+        pcm = (pcm * 32767.0).astype(np.int16)
+        stereo = np.repeat(pcm[:, None], 2, axis=1)
+        with wave.open(path, "wb") as wav_file:
+            wav_file.setnchannels(2)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(SAMPLE_RATE)
+            wav_file.writeframes(stereo.tobytes())
+        with global_rec_lock:
+            global_rec["last_path"] = path
+            global_rec["last_error"] = ""
+        return path, ""
+    except Exception as exc:
+        with global_rec_lock:
+            global_rec["last_error"] = str(exc)
+        return "", str(exc)
 
 def stop_loop_recording():
     with loop_lock:
@@ -618,50 +906,98 @@ def gen_synth(frames):
 
 delay_buf = np.zeros(SAMPLE_RATE, dtype=np.float32)
 delay_idx = 0
+reverb_buf = np.zeros(int(SAMPLE_RATE * 1.4), dtype=np.float32)
+reverb_idx = 0
+fx_tone_state = {"warm_lp": 0.0, "air_lp": 0.0, "reverb_damp": 0.0}
+REVERB_TAPS = [int(SAMPLE_RATE * t) for t in (0.113, 0.173, 0.229, 0.317)]
 synth_dc_state = {"x1": 0.0, "y1": 0.0}
 master_dc_state = {"x1": 0.0, "y1": 0.0}
 master_limiter_state = {"gain": 1.0}
 
 def apply_fx(signal):
-    global delay_idx
+    global delay_idx, reverb_idx
     with synth_lock:
         drive_target    = synth["fx_drive"]
         mix_target      = synth["fx_delay_mix"]
         feedback_target = synth["fx_delay_feedback"]
         dtime_target    = synth["fx_delay_time"]
+        warmth_target   = synth["fx_warmth"]
+        air_target      = synth["fx_air"]
+        reverb_target   = synth["fx_reverb"]
         drive_cur       = synth["fx_drive_current"]
         mix_cur         = synth["fx_delay_mix_current"]
         feedback_cur    = synth["fx_delay_feedback_current"]
         dtime_cur       = synth["fx_delay_time_current"]
+        warmth_cur      = synth["fx_warmth_current"]
+        air_cur         = synth["fx_air_current"]
+        reverb_cur      = synth["fx_reverb_current"]
 
-    if max(drive_target, mix_target, drive_cur, mix_cur) <= 0.0001:
+    if max(
+        drive_target, mix_target, warmth_target, air_target, reverb_target,
+        drive_cur, mix_cur, warmth_cur, air_cur, reverb_cur,
+    ) <= 0.0001:
         return signal
 
     out = np.empty_like(signal)
     fx_alpha = 1.0 - np.exp(-1.0 / max(1.0, FX_SMOOTH_TIME * SAMPLE_RATE))
     delay_len = len(delay_buf)
+    reverb_len = len(reverb_buf)
+    warm_lp = fx_tone_state["warm_lp"]
+    air_lp = fx_tone_state["air_lp"]
+    reverb_damp = fx_tone_state["reverb_damp"]
 
     for i, dry in enumerate(signal):
         drive_cur += (drive_target - drive_cur) * fx_alpha
         mix_cur += (mix_target - mix_cur) * fx_alpha
         feedback_cur += (feedback_target - feedback_cur) * fx_alpha
         dtime_cur += (dtime_target - dtime_cur) * fx_alpha
+        warmth_cur += (warmth_target - warmth_cur) * fx_alpha
+        air_cur += (air_target - air_cur) * fx_alpha
+        reverb_cur += (reverb_target - reverb_cur) * fx_alpha
+
+        warm_lp += (dry - warm_lp) * (0.018 + warmth_cur * 0.05)
+        warmed = dry * (1.0 - warmth_cur * 0.28) + warm_lp * warmth_cur * 0.28
 
         gain = 1.0 + drive_cur * 8.0
         norm = max(np.tanh(gain), 1e-6)
         delay_samples = max(1, int((0.08 + dtime_cur * 0.72) * SAMPLE_RATE))
-        driven = np.tanh(dry * gain) / norm
+        driven = np.tanh(warmed * gain) / norm
+        if warmth_cur > 0.0001:
+            driven = soft_saturate_sample(driven + (warm_lp - driven) * warmth_cur * 0.18, drive=1.0 + warmth_cur * 0.6, ceiling=0.96)
+
+        air_lp += (driven - air_lp) * 0.14
+        airy = driven + (driven - air_lp) * air_cur * 0.55
+
         wet = delay_buf[(delay_idx - delay_samples) % delay_len]
-        out[i] = driven * (1.0 - mix_cur) + wet * mix_cur
-        fed = driven * 0.82 + wet * feedback_cur
+        delayed = airy * (1.0 - mix_cur) + wet * mix_cur
+        fed = airy * 0.82 + wet * feedback_cur
         delay_buf[delay_idx] = soft_saturate_sample(fed, drive=1.02, ceiling=0.9)
+
+        tap1 = reverb_buf[(reverb_idx - REVERB_TAPS[0]) % reverb_len]
+        tap2 = reverb_buf[(reverb_idx - REVERB_TAPS[1]) % reverb_len]
+        tap3 = reverb_buf[(reverb_idx - REVERB_TAPS[2]) % reverb_len]
+        tap4 = reverb_buf[(reverb_idx - REVERB_TAPS[3]) % reverb_len]
+        reverb_wet = (tap1 + tap2 * 0.85 + tap3 * 0.72 + tap4 * 0.58) / 3.15
+        reverb_damp += (reverb_wet - reverb_damp) * 0.08
+        reverb_feed = airy * (0.18 + reverb_cur * 0.08) + reverb_damp * (0.72 + reverb_cur * 0.18)
+        reverb_buf[reverb_idx] = soft_saturate_sample(reverb_feed, drive=1.01, ceiling=0.9)
+
+        out[i] = delayed * (1.0 - reverb_cur * 0.42) + reverb_wet * reverb_cur * 0.42
         delay_idx = (delay_idx + 1) % delay_len
+        reverb_idx = (reverb_idx + 1) % reverb_len
 
     with synth_lock:
         synth["fx_drive_current"] = drive_cur
         synth["fx_delay_mix_current"] = mix_cur
         synth["fx_delay_feedback_current"] = feedback_cur
         synth["fx_delay_time_current"] = dtime_cur
+        synth["fx_warmth_current"] = warmth_cur
+        synth["fx_air_current"] = air_cur
+        synth["fx_reverb_current"] = reverb_cur
+
+    fx_tone_state["warm_lp"] = warm_lp
+    fx_tone_state["air_lp"] = air_lp
+    fx_tone_state["reverb_damp"] = reverb_damp
 
     return out * 0.95
 
@@ -682,23 +1018,24 @@ def audio_cb(outdata, frames, t, status):
     drum_out = np.zeros(frames, dtype=np.float32)
     with drum_lock:
         pending_trigs = drum["trig"][:]
-        drum["trig"] = [False] * 4
+        drum["trig"] = [False] * NUM_DRUM_VOICES
         drum_vols = drum["vol"][:]
+        drum_bank = current_drum_bank_locked()
 
     for v, pending in enumerate(pending_trigs):
         if pending:
             reset_drum_voice(v)
             drum_trig_sample[v] = _sample_clock
 
-    for v in range(4):
+    for v in range(NUM_DRUM_VOICES):
         if drum_trig_sample[v] < 0:
             continue
         age = _sample_clock - drum_trig_sample[v]
-        if age >= DRUM_LENGTHS[v]:
+        if age >= drum_bank["lengths"][v]:
             drum_trig_sample[v] = -1
             continue
-        remaining = min(frames, DRUM_LENGTHS[v] - age)
-        chunk = DRUM_SYNTHS[v](age, remaining)
+        remaining = min(frames, drum_bank["lengths"][v] - age)
+        chunk = DRUM_SYNTHS[v](drum_bank, age, remaining)
         drum_out[:remaining] += chunk * drum_vols[v] * 0.6
 
     drum_out *= 0.62
@@ -708,6 +1045,9 @@ def audio_cb(outdata, frames, t, status):
     mixed = apply_master_limiter(mixed, master_limiter_state)
     mixed *= OUTPUT_GAIN
     np.clip(mixed, -LIMIT_CEILING, LIMIT_CEILING, out=mixed)
+    with global_rec_lock:
+        if global_rec["recording"]:
+            global_rec["chunks"].append(mixed.copy())
     scope_show_drums = ui_state["scope_show_drums"]
     scope_sig = mixed if scope_show_drums else synth_bus
 
@@ -718,6 +1058,35 @@ def audio_cb(outdata, frames, t, status):
         scope_buf.extend(scope_sig)
     _sample_clock += frames
 
+def apply_drum_pattern_locked(pattern_idx):
+    drum["steps"] = [[False] * NUM_STEPS for _ in range(NUM_DRUM_VOICES)]
+    if pattern_idx == 0:
+        for step in (0, 8, 16, 24):
+            drum["steps"][0][step] = True
+        for step in (4, 12, 20, 28):
+            drum["steps"][1][step] = True
+        for step in (12, 28):
+            drum["steps"][2][step] = True
+        for step in range(0, NUM_STEPS, 2):
+            drum["steps"][3][step] = True
+        for step in (6, 14, 22, 30):
+            drum["steps"][4][step] = True
+        for step in (10, 26):
+            drum["steps"][5][step] = True
+    else:
+        for step in (0, 11, 16, 24):
+            drum["steps"][0][step] = True
+        for step in (4, 12, 20, 28):
+            drum["steps"][1][step] = True
+        for step in (10, 26):
+            drum["steps"][2][step] = True
+        for step in range(NUM_STEPS):
+            drum["steps"][3][step] = (step % 2 == 0)
+        for step in (7, 15, 23, 31):
+            drum["steps"][4][step] = True
+        for step in (6, 22, 30):
+            drum["steps"][5][step] = True
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SEQUENCER THREAD
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -727,17 +1096,17 @@ def sequencer_thread():
             running = drum["running"]
             bpm     = drum["bpm"]
             step    = drum["cur_step"]
-            steps   = [drum["steps"][v][step] for v in range(4)]
+            steps   = [drum["steps"][v][step] for v in range(NUM_DRUM_VOICES)]
 
         if running:
             # fire triggers for active steps
             with drum_lock:
-                for v in range(4):
+                for v in range(NUM_DRUM_VOICES):
                     if steps[v]:
                         drum["trig"][v] = True
                 drum["cur_step"] = (step + 1) % NUM_STEPS
 
-            beat_dur = 60.0 / bpm / 4.0   # 16th notes
+            beat_dur = 60.0 / bpm / 4.0   # 16th notes across 32 steps
             time.sleep(beat_dur)
         else:
             time.sleep(0.05)
@@ -878,12 +1247,15 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
             ([",", ".", ";", "'"], "Adjust LFO rate and depth."),
             (["p", "-", "=", "_", "+"], "Toggle filter, adjust cutoff and resonance."),
             (["D", "F", "J", "K", "N", "M", "V", "B"], "Drive, delay mix, feedback, and delay time."),
+            (["S + ←→"], "In settings, adjust warmth, air, and reverb."),
         ]),
         ("LOOP + DRUMS", [
-            (["R", "T", "P", "U"], "Record, overdub, toggle playback, or clear the loop."),
+            (["R", "T", "Y", "P", "U"], "Record, overdub, undo last overdub layer, toggle playback, or clear the loop."),
+            (["G"], "Start or stop global mix recording to a WAV file."),
             (["TAB"], "Switch between synth focus and drum sequencer focus."),
             (["←", "→", "↑", "↓"], "Move around the drum grid while sequencer focus is active."),
-            (["SPC", "r", "c", "C"], "Toggle step, run, clear row, or clear all."),
+            (["SPC", "r", "c", "C", "1", "2"], "Toggle step, run, clear row, clear all, or load a 32-step pattern."),
+            (["S"], "Open settings to switch drum banks and synth edit options."),
         ]),
     ]
 
@@ -937,6 +1309,8 @@ def draw(stdscr):
     curses.init_pair(12, curses.COLOR_BLACK,   curses.COLOR_CYAN)    # hihat
     curses.init_pair(13, curses.COLOR_BLACK,   curses.COLOR_MAGENTA) # top
     curses.init_pair(14, curses.COLOR_WHITE,   curses.COLOR_BLACK)   # step off+cursor
+    curses.init_pair(15, curses.COLOR_BLACK,   curses.COLOR_BLUE)    # clap
+    curses.init_pair(16, curses.COLOR_BLACK,   curses.COLOR_WHITE)   # tom/cym
 
     stream = sd.OutputStream(samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE,
                               channels=2, dtype='float32', latency=0.2, callback=audio_cb)
@@ -976,9 +1350,9 @@ def draw(stdscr):
                 elif ch in (27, ord('S')):
                     settings_open = False
                 elif ch == curses.KEY_UP:
-                    settings_cursor = (settings_cursor - 1) % 8
+                    settings_cursor = (settings_cursor - 1) % 12
                 elif ch == curses.KEY_DOWN:
-                    settings_cursor = (settings_cursor + 1) % 8
+                    settings_cursor = (settings_cursor + 1) % 12
                 elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
                     delta = -1 if ch == curses.KEY_LEFT else 1
                     if settings_cursor == 0:
@@ -988,23 +1362,35 @@ def draw(stdscr):
                         with ui_lock:
                             ui_state["scope_show_drums"] = not ui_state["scope_show_drums"]
                     elif settings_cursor == 2:
-                        with synth_lock:
-                            synth["voices"] = int(clamp(synth["voices"] + delta, 1, MAX_VOICES))
+                        with drum_lock:
+                            drum["bank"] = (drum["bank"] + delta) % len(DRUM_BANKS)
                     elif settings_cursor == 3:
                         with synth_lock:
-                            synth["active_osc"] = (synth["active_osc"] + delta) % 2
+                            synth["voices"] = int(clamp(synth["voices"] + delta, 1, MAX_VOICES))
                     elif settings_cursor == 4:
                         with synth_lock:
-                            active_osc_locked()["waveform"] = (active_osc_locked()["waveform"] + delta) % len(WAVEFORMS)
+                            synth["active_osc"] = (synth["active_osc"] + delta) % 2
                     elif settings_cursor == 5:
                         with synth_lock:
-                            active_osc_locked()["level"] = clamp(active_osc_locked()["level"] + delta * 0.05, 0.0, 1.0)
+                            active_osc_locked()["waveform"] = (active_osc_locked()["waveform"] + delta) % len(WAVEFORMS)
                     elif settings_cursor == 6:
                         with synth_lock:
-                            active_osc_locked()["octave"] = int(clamp(active_osc_locked()["octave"] + delta, -2, 2))
+                            active_osc_locked()["level"] = clamp(active_osc_locked()["level"] + delta * 0.05, 0.0, 1.0)
                     elif settings_cursor == 7:
                         with synth_lock:
+                            active_osc_locked()["octave"] = int(clamp(active_osc_locked()["octave"] + delta, -2, 2))
+                    elif settings_cursor == 8:
+                        with synth_lock:
                             active_osc_locked()["detune_cents"] = clamp(active_osc_locked()["detune_cents"] + delta * 2.0, -24.0, 24.0)
+                    elif settings_cursor == 9:
+                        with synth_lock:
+                            synth["fx_warmth"] = clamp(synth["fx_warmth"] + delta * 0.05, 0.0, 1.0)
+                    elif settings_cursor == 10:
+                        with synth_lock:
+                            synth["fx_air"] = clamp(synth["fx_air"] + delta * 0.05, 0.0, 1.0)
+                    elif settings_cursor == 11:
+                        with synth_lock:
+                            synth["fx_reverb"] = clamp(synth["fx_reverb"] + delta * 0.05, 0.0, 1.0)
             else:
                 if ch == ord('\t'):
                     focus = "seq" if focus=="synth" else "synth"
@@ -1054,38 +1440,33 @@ def draw(stdscr):
                             stop_loop_recording()
                         else:
                             with loop_lock:
-                                loop["buffer"].fill(0.0)
-                                loop["length"] = 0
-                                loop["write_pos"] = 0
-                                loop["read_pos"] = 0
+                                clear_loop_locked()
                                 loop["recording"] = True
-                                loop["playing"] = False
-                                loop["overdub"] = False
-                                loop["has_audio"] = False
                     elif ch == ord('T'):
                         with loop_lock:
                             if loop["recording"] and loop["overdub"]:
                                 loop["recording"] = False
                                 loop["overdub"] = False
                             elif loop["has_audio"]:
+                                push_loop_undo_locked()
                                 loop["recording"] = True
                                 loop["playing"] = True
                                 loop["overdub"] = True
                                 loop["write_pos"] = loop["read_pos"]
+                    elif ch == ord('Y'):
+                        undo_last_overdub()
                     elif ch == ord('P'):
                         with loop_lock:
                             if loop["has_audio"]:
                                 loop["playing"] = not loop["playing"]
                     elif ch == ord('U'):
                         with loop_lock:
-                            loop["buffer"].fill(0.0)
-                            loop["length"] = 0
-                            loop["write_pos"] = 0
-                            loop["read_pos"] = 0
-                            loop["recording"] = False
-                            loop["playing"] = False
-                            loop["overdub"] = False
-                            loop["has_audio"] = False
+                            clear_loop_locked()
+                    elif ch == ord('G'):
+                        if global_rec["recording"]:
+                            stop_global_recording()
+                        else:
+                            start_global_recording()
                     elif ch == curses.KEY_UP:
                         with synth_lock: synth["volume"]=clamp(synth["volume"]+0.05,0,1)
                     elif ch == curses.KEY_DOWN:
@@ -1142,9 +1523,9 @@ def draw(stdscr):
                 else:  # focus == "seq"
                     if ch == ord('q'): break
                     elif ch == curses.KEY_UP:
-                        seq_cursor_v = (seq_cursor_v - 1) % 4
+                        seq_cursor_v = (seq_cursor_v - 1) % NUM_DRUM_VOICES
                     elif ch == curses.KEY_DOWN:
-                        seq_cursor_v = (seq_cursor_v + 1) % 4
+                        seq_cursor_v = (seq_cursor_v + 1) % NUM_DRUM_VOICES
                     elif ch == curses.KEY_LEFT:
                         seq_cursor_s = (seq_cursor_s - 1) % NUM_STEPS
                     elif ch == curses.KEY_RIGHT:
@@ -1158,7 +1539,7 @@ def draw(stdscr):
                     elif ch == ord('c'):
                         with drum_lock: drum["steps"][seq_cursor_v] = [False]*NUM_STEPS
                     elif ch == ord('C'):
-                        with drum_lock: drum["steps"] = [[False]*NUM_STEPS for _ in range(4)]
+                        with drum_lock: drum["steps"] = [[False]*NUM_STEPS for _ in range(NUM_DRUM_VOICES)]
                     elif ch == ord(','):
                         with drum_lock: drum["bpm"] = clamp(drum["bpm"]-1, 40, 300)
                     elif ch == ord('.'):
@@ -1173,21 +1554,10 @@ def draw(stdscr):
                         with drum_lock: drum["vol"][seq_cursor_v]=clamp(drum["vol"][seq_cursor_v]+0.05,0,1)
                     elif ch == ord('1'):
                         with drum_lock:
-                            drum["steps"][0] = [True,False,False,False, True,False,False,False,
-                                                True,False,False,False, True,False,False,False]
-                            drum["steps"][1] = [False,False,False,False, True,False,False,False,
-                                                False,False,False,False, True,False,False,False]
-                            drum["steps"][2] = [True,False,True,False]*4
-                            drum["steps"][3] = [False]*16
+                            apply_drum_pattern_locked(0)
                     elif ch == ord('2'):
                         with drum_lock:
-                            drum["steps"][0] = [True,False,False,False, False,False,False,False,
-                                                True,False,False,True,  False,False,False,False]
-                            drum["steps"][1] = [False,False,False,False, True,False,False,False,
-                                                False,False,False,False, True,False,False,True]
-                            drum["steps"][2] = [True]*16
-                            drum["steps"][3] = [False,False,False,False, False,False,False,False,
-                                                True,False,False,False,  False,False,True,False]
+                            apply_drum_pattern_locked(1)
 
             # ── snapshot ───────────────────────────
             with synth_lock:
@@ -1201,6 +1571,7 @@ def draw(stdscr):
                 res=synth["resonance"]; lfo_ph=synth["lfo_phase"]
                 fx_drive=synth["fx_drive"]; fx_mix=synth["fx_delay_mix"]
                 fx_feedback=synth["fx_delay_feedback"]; fx_time=synth["fx_delay_time"]
+                fx_warmth=synth["fx_warmth"]; fx_air=synth["fx_air"]; fx_reverb=synth["fx_reverb"]
                 oscillators=[{
                     "waveform": osc["waveform"],
                     "level": osc["level"],
@@ -1217,6 +1588,12 @@ def draw(stdscr):
                 loop_overdub=loop["overdub"]
                 loop_has_audio=loop["has_audio"]
                 loop_length=loop["length"]
+                loop_undo_depth=len(loop["undo_stack"])
+
+            with global_rec_lock:
+                global_recording=global_rec["recording"]
+                global_last_path=global_rec["last_path"]
+                global_last_error=global_rec["last_error"]
 
             with ui_lock:
                 theme=ui_state["theme"]
@@ -1226,6 +1603,7 @@ def draw(stdscr):
                 d_steps   = [row[:] for row in drum["steps"]]
                 d_running = drum["running"]
                 d_bpm     = drum["bpm"]
+                d_bank_name = current_drum_bank_locked()["name"]
                 d_cur     = drum["cur_step"]
                 d_vol     = drum["vol"][:]
 
@@ -1235,7 +1613,7 @@ def draw(stdscr):
             h, w = stdscr.getmaxyx()
             stdscr.erase()
 
-            C  = [curses.color_pair(i) for i in range(15)]
+            C  = [curses.color_pair(i) for i in range(17)]
             B  = curses.A_BOLD
             DIM= curses.A_DIM
             scope_attr = [C[7], C[5], C[6]][theme % 3]
@@ -1247,7 +1625,7 @@ def draw(stdscr):
             # ══════════════════════════════════════
             CTRL_W   = 40
             scope_x  = CTRL_W
-            DRUM_H   = 7
+            DRUM_H   = 9
             drum_top = max(h - DRUM_H, 2)
             show_help = (now < help_until) and not settings_open
             base_note_name = midi_to_name(base_midi)
@@ -1293,7 +1671,12 @@ def draw(stdscr):
             safe_addstr(stdscr,9,25,f"VOI {int(voices)}",C[6])
             loop_state = "REC" if loop_recording and not loop_overdub else ("DUB" if loop_overdub else ("PLY" if loop_playing else ("HLD" if loop_has_audio else "OFF")))
             safe_addstr(stdscr,10,4,f"LOOP {loop_state:>3} {loop_secs:4.1f}s", (C[4]|B) if loop_recording or loop_playing else C[3])
-            safe_addstr(stdscr,10,24,f"XR {xruns:02d}", C[6])
+            safe_addstr(stdscr,10,24,f"UND {loop_undo_depth:02d}", C[6])
+            safe_addstr(stdscr,10,34,f"XR {xruns:02d}", C[6])
+            grec_lbl = "GREC ON" if global_recording else "GREC OFF"
+            safe_addstr(stdscr,11,4,grec_lbl, (C[4]|B) if global_recording else C[3])
+            grec_msg = global_last_error if global_last_error else (os.path.basename(global_last_path) if global_last_path else "")
+            safe_addstr(stdscr,11,14,grec_msg[:24], C[6]|DIM)
 
             # ── ENV ────────────────────────────────
             safe_addstr(stdscr,12,2,"─ ENV ─────────────────────",C[2])
@@ -1333,13 +1716,14 @@ def draw(stdscr):
             safe_addstr(stdscr,26,24,"TIME",C[2]); safe_addstr(stdscr,26,29,f"{delay_ms:3d}ms",C[3]); safe_addstr(stdscr,26,36,"V/B",C[6])
             safe_addstr(stdscr,27,4,"DLY ",C[2]); safe_addstr(stdscr,27,9,hbar(fx_mix,8),C[5]); safe_addstr(stdscr,27,18,"J/K",C[6])
             safe_addstr(stdscr,27,24,"FBK ",C[2]); safe_addstr(stdscr,27,29,hbar(fx_feedback,6),C[5]); safe_addstr(stdscr,27,36,"N/M",C[6])
+            safe_addstr(stdscr,28,4,f"WRM {int(fx_warmth*100):3d}% AIR {int(fx_air*100):3d}% RVB {int(fx_reverb*100):3d}%",C[6])
 
             # ── KEYS ───────────────────────────────
             safe_addstr(stdscr,29,2,"KEYS",C[2])
             safe_addstr(stdscr,29,8,"a w s e d f t g y h u j k",C[3])
             key_status = f" ♪ {last_note} " if note else (" ♪ FREE " if gate==1 else f" ROOT {base_note_name} ")
             safe_addstr(stdscr,30,2,key_status,(C[4]|B) if (note or gate==1) else C[3])
-            safe_addstr(stdscr,30,16,"R rec  T dub  P play  U clear",C[6]|DIM)
+            safe_addstr(stdscr,30,16,"R rec  T dub  Y undo  P play  U clear  G wav",C[6]|DIM)
 
             # ══════════════════════════════════════
             #  SCOPE  (top-right)
@@ -1373,25 +1757,27 @@ def draw(stdscr):
             safe_addstr(stdscr, drum_top, 18, bpm_str, C[3])
             safe_addstr(stdscr, drum_top, 27, ",/. bpm", C[6])
             safe_addstr(stdscr, drum_top, 36, "r=start/stop", C[6])
+            if w > 60:
+                safe_addstr(stdscr, drum_top, 49, f"set:{d_bank_name}", C[6])
 
             # step numbers header
             step_x0 = 6
+            step_cell_w = 2
             for s in range(NUM_STEPS):
-                sx = step_x0 + s*3
-                # beat marker every 4 steps
+                sx = step_x0 + s*step_cell_w
                 if s % 4 == 0:
-                    safe_addstr(stdscr, drum_top+1, sx, f"{s+1:2d} ", C[2])
+                    safe_addstr(stdscr, drum_top+1, sx, f"{(s+1)%100:02d}", C[2])
                 else:
-                    safe_addstr(stdscr, drum_top+1, sx, "·  ", C[2]|DIM)
+                    safe_addstr(stdscr, drum_top+1, sx, "· ", C[2]|DIM)
 
             # playhead indicator
-            ph_x = step_x0 + d_cur*3
+            ph_x = step_x0 + d_cur*step_cell_w
             if d_running:
                 safe_addstr(stdscr, drum_top+1, ph_x, "▼", C[4]|B)
 
             # voice rows
-            VOICE_COLORS = [10, 11, 12, 13]
-            for v in range(4):
+            VOICE_COLORS = [10, 11, 15, 12, 16, 13]
+            for v in range(NUM_DRUM_VOICES):
                 row = drum_top + 2 + v
                 # voice label + volume
                 vlbl = DRUM_NAMES[v]
@@ -1403,29 +1789,25 @@ def draw(stdscr):
                 safe_addstr(stdscr, row, 5, "▕", C[2]|DIM)
 
                 for s in range(NUM_STEPS):
-                    sx = step_x0 + s*3
+                    sx = step_x0 + s*step_cell_w
                     on = d_steps[v][s]
                     is_cur_step = d_running and s==d_cur
                     is_cursor   = (focus=="seq" and seq_cursor_v==v and seq_cursor_s==s)
 
                     if is_cursor:
-                        if on:
-                            ch_str = "[■]"
-                            attr   = C[VOICE_COLORS[v]] | B
-                        else:
-                            ch_str = "[ ]"
-                            attr   = C[8] | B
+                        ch_str = "■ " if on else "· "
+                        attr   = C[8] | B
                     elif on:
-                        ch_str = " ■ " if not is_cur_step else "►■◄"
+                        ch_str = "■ "
                         attr   = (C[VOICE_COLORS[v]] | B) if is_cur_step else C[VOICE_COLORS[v]]
                     else:
-                        ch_str = " · "
+                        ch_str = "· "
                         attr   = (C[5]|DIM) if is_cur_step else (C[3]|DIM)
 
                     safe_addstr(stdscr, row, sx, ch_str, attr)
 
                 # vol bar at end
-                vol_x = step_x0 + NUM_STEPS*3 + 1
+                vol_x = step_x0 + NUM_STEPS*step_cell_w + 1
                 safe_addstr(stdscr, row, vol_x, hbar(vv, 6), C[5] if is_selected else (C[5]|DIM))
                 safe_addstr(stdscr, row, vol_x+7, "-/=" if is_selected else "   ", C[6])
 
@@ -1433,9 +1815,9 @@ def draw(stdscr):
             if settings_open:
                 ftr = " ↑↓ select | ←→ change | S/Esc close | H hold help | q quit "
             elif focus == "synth":
-                ftr = " TAB=drums | 1/2 osc | R/T/P/U loop | S settings | q quit "
+                ftr = " TAB=drums | R/T/Y/P/U loop | G wav | S settings | q quit "
             else:
-                ftr = " TAB=synth | ←→↑↓ move | SPC toggle | r run | S settings | H hold help | q quit "
+                ftr = " TAB=synth | ←→↑↓ move | SPC toggle | r run | 1/2 patterns | S settings | q quit "
             safe_addstr(stdscr, h-1, 0, ftr[:w-1], C[1])
 
             if show_help:
@@ -1443,19 +1825,23 @@ def draw(stdscr):
 
             if settings_open:
                 box_w = min(48, max(30, w - 10))
-                box_h = 13
+                box_h = 17
                 box_x = max(2, (w - box_w) // 2)
                 box_y = max(2, (h - box_h) // 2)
                 draw_box(stdscr, box_y, box_x, box_w, box_h, "SETTINGS", scope_attr|B)
                 rows = [
                     f"Theme        {THEME_NAMES[theme]}",
                     f"Scope source {'MIX' if scope_show_drums else 'SYNTH ONLY'}",
+                    f"Drum set     {d_bank_name}",
                     f"Voices       {int(voices)}",
                     f"Edit osc     OSC{active_osc + 1}",
                     f"Waveform     {WAVEFORMS[oscillators[active_osc]['waveform']]}",
                     f"Osc level    {int(oscillators[active_osc]['level'] * 100):3d}%",
                     f"Osc octave   {oscillators[active_osc]['octave']:+d}",
                     f"Osc detune   {oscillators[active_osc]['detune_cents']:+5.1f}c",
+                    f"FX warmth    {int(fx_warmth * 100):3d}%",
+                    f"FX air       {int(fx_air * 100):3d}%",
+                    f"FX reverb    {int(fx_reverb * 100):3d}%",
                 ]
                 for idx, row_text in enumerate(rows):
                     attr = (C[8]|B) if idx == settings_cursor else C[3]
@@ -1466,6 +1852,8 @@ def draw(stdscr):
             time.sleep(0.04)
 
     finally:
+        if global_rec["recording"]:
+            stop_global_recording()
         stream.stop(); stream.close()
 
 curses.wrapper(draw)
