@@ -2276,8 +2276,7 @@ def draw(stdscr):
     held_note    = None      # tracks which note key is "down"
     last_note_t  = 0.0
     NOTE_TIMEOUT = 0.22      # release after 220ms with no key repeat
-    HELP_TIMEOUT = 0.20
-    help_until   = 0.0
+    help_open    = False
     seq_cursor_v = 0
     seq_cursor_s = 0
     focus = "synth"
@@ -2303,7 +2302,7 @@ def draw(stdscr):
             now = time.time()
 
             if ch == ord('H'):
-                help_until = now + HELP_TIMEOUT
+                help_open = not help_open
 
             if drum_notice_until and now >= drum_notice_until:
                 drum_notice = ""
@@ -2534,7 +2533,9 @@ def draw(stdscr):
                                     midi["note_bindings"][target_id] = None
                                 midi["status"] = f"Cleared {MIDI_BIND_LABELS[target_id]}"
             else:
-                if ch == ord('\t'):
+                if ch == 27 and help_open:
+                    help_open = False
+                elif ch == ord('\t'):
                     focus = "seq" if focus=="synth" else "synth"
                     with synth_lock:
                         synth["key_note_on"] = False
@@ -2838,7 +2839,7 @@ def draw(stdscr):
             scope_x  = CTRL_W
             DRUM_H   = 9
             drum_top = max(h - DRUM_H, 2)
-            show_help = (now < help_until) and not settings_open
+            show_help = help_open and not settings_open
             base_note_name = midi_to_name(base_midi)
             play_note_name = midi_to_name(play_midi)
             delay_ms = int(80 + fx_time * 720)
