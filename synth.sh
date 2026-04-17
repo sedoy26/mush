@@ -8,7 +8,7 @@ PY_SCRIPT="$HOME/.mursynth.py"
 
 cat > "$PY_SCRIPT" << 'PYEOF'
 import curses, numpy as np, sounddevice as sd
-import os, threading, time, textwrap, wave
+import os, shutil, subprocess, threading, time, textwrap, wave
 from collections import deque
 
 try:
@@ -44,6 +44,11 @@ MASTER_LIMIT_ATTACK = 0.002
 MASTER_LIMIT_RELEASE = 0.08
 LOOP_UNDO_LIMIT = 12
 GLOBAL_REC_FILENAME = "untiteled.wav"
+CAMERA_CAPTURE_FPS = 30
+CAMERA_OUTPUT_FPS = 12
+CAMERA_FRAME_WIDTH = 160
+CAMERA_FRAME_HEIGHT = 90
+CAMERA_DEVICE = os.environ.get("MURSYNTH_CAMERA_DEVICE", "0")
 
 KEYBOARD_OFFSETS = {
     ord('a'):0,  ord('w'):1,  ord('s'):2,  ord('e'):3,
@@ -53,7 +58,22 @@ KEYBOARD_OFFSETS = {
 }
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 THEME_NAMES = ["MAGENTA", "MINT", "AMBER"]
-SETTINGS_PAGE_NAMES = ["MAIN", "MIDI DEV", "MIDI NOTE", "MIDI MAP"]
+VISUAL_MODES = ["SCOPE", "CAM"]
+CAMERA_REACTIVE_STYLES = [
+    "OFF",
+    "KICK FLASH",
+    "SYNTH GLOW",
+    "DRUM PUNCH",
+    "BASS SCAN",
+    "EDGE PULSE",
+    "GLITCH SHIFT",
+    "GATE POSTER",
+    "FIRE STORM",
+    "ICE PULSE",
+    "CHROMA SPLIT",
+    "MATRIX BEAT",
+]
+SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "MIDI DEV", "MIDI NOTE", "MIDI MAP"]
 MIDI_PAD_TARGETS = [
     ("pad_kick", "Pad Kick", "note"),
     ("pad_snare", "Pad Snare", "note"),
@@ -160,9 +180,23 @@ global_rec_lock = threading.Lock()
 
 ui_state = {
     "theme": 0,
+    "visual_mode": 0,
+    "camera_style": 0,
+    "camera_reactivity": 0.85,
     "scope_show_drums": True,
 }
 ui_lock = threading.Lock()
+camera_state = {
+    "gray": None,
+    "error": "Camera idle",
+    "thread": None,
+    "process": None,
+    "stop_event": threading.Event(),
+    "running": False,
+}
+camera_lock = threading.Lock()
+reactive_state = {"master": 0.0, "synth": 0.0, "drums": 0.0, "kick": 0.0, "snare": 0.0, "hat": 0.0, "note": 0.0}
+reactive_lock = threading.Lock()
 
 midi = {
     "enabled": False,
@@ -364,6 +398,17 @@ def active_osc_locked():
 
 def current_drum_bank_locked():
     return DRUM_BANKS[drum["bank"]]
+
+def draw_visual_line(scr, y, x, line, default_attr=0):
+    if isinstance(line, str):
+        safe_addstr(scr, y, x, line, default_attr)
+        return
+    cx = x
+    for segment, attr in line:
+        if not segment:
+            continue
+        safe_addstr(scr, y, cx, segment, attr)
+        cx += len(segment)
 
 def short_label(text, width):
     text = str(text)
@@ -1348,6 +1393,7 @@ def audio_cb(outdata, frames, t, status):
     mixed = apply_master_limiter(mixed, master_limiter_state)
     mixed *= OUTPUT_GAIN
     np.clip(mixed, -LIMIT_CEILING, LIMIT_CEILING, out=mixed)
+    update_reactive_state(frames, synth_bus, drum_out, mixed, pending_trigs)
     with global_rec_lock:
         if global_rec["recording"]:
             global_rec["chunks"].append(mixed.copy())
@@ -1423,6 +1469,149 @@ seq_thread.start()
 BRAILLE_BASE = 0x2800
 BD = [[0x01,0x02,0x04,0x40],[0x08,0x10,0x20,0x80]]
 
+def camera_command():
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    return [
+        ffmpeg,
+        "-loglevel", "quiet",
+        "-f", "avfoundation",
+        "-framerate", str(CAMERA_CAPTURE_FPS),
+        "-video_size", "640x480",
+        "-i", CAMERA_DEVICE,
+        "-vf", f"fps={CAMERA_OUTPUT_FPS},format=gray,eq=contrast=2.5:brightness=0.05,scale={CAMERA_FRAME_WIDTH}:{CAMERA_FRAME_HEIGHT}",
+        "-f", "rawvideo",
+        "-pix_fmt", "gray",
+        "pipe:1",
+    ]
+
+def stop_camera_stream():
+    with camera_lock:
+        thread = camera_state["thread"]
+        proc = camera_state["process"]
+        if thread is None and proc is None and not camera_state["running"]:
+            camera_state["gray"] = None
+            camera_state["error"] = "Camera idle"
+            return
+        camera_state["stop_event"].set()
+        camera_state["running"] = False
+        camera_state["thread"] = None
+        camera_state["process"] = None
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=1.0)
+    with camera_lock:
+        camera_state["gray"] = None
+        camera_state["error"] = "Camera idle"
+
+def camera_worker():
+    cmd = camera_command()
+    if cmd is None:
+        with camera_lock:
+            camera_state["running"] = False
+            camera_state["error"] = "ffmpeg not found"
+        return
+
+    frame_size = CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT
+    proc = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        with camera_lock:
+            camera_state["process"] = proc
+            camera_state["error"] = "Starting camera..."
+        stdout = proc.stdout
+        if stdout is None:
+            raise RuntimeError("Camera pipe unavailable")
+
+        while not camera_state["stop_event"].is_set():
+            buf = bytearray()
+            while len(buf) < frame_size and not camera_state["stop_event"].is_set():
+                chunk = stdout.read(frame_size - len(buf))
+                if not chunk:
+                    raise RuntimeError("Camera stream ended")
+                buf.extend(chunk)
+            if len(buf) < frame_size:
+                break
+            gray = np.frombuffer(bytes(buf), dtype=np.uint8).reshape((CAMERA_FRAME_HEIGHT, CAMERA_FRAME_WIDTH))
+            with camera_lock:
+                camera_state["gray"] = gray
+                camera_state["error"] = ""
+    except Exception as exc:
+        with camera_lock:
+            camera_state["gray"] = None
+            camera_state["error"] = short_label(str(exc), 48)
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        with camera_lock:
+            camera_state["process"] = None
+            camera_state["thread"] = None
+            camera_state["running"] = False
+
+def ensure_camera_stream_running():
+    with camera_lock:
+        if camera_state["running"] and camera_state["thread"] is not None:
+            return
+        camera_state["stop_event"].clear()
+        camera_state["running"] = True
+        thread = threading.Thread(target=camera_worker, daemon=True)
+        camera_state["thread"] = thread
+    thread.start()
+
+def compress_visual_segments(chars, attrs):
+    if not chars:
+        return []
+    segments = []
+    start = 0
+    cur_attr = attrs[0]
+    for idx in range(1, len(chars)):
+        if attrs[idx] != cur_attr:
+            segments.append(("".join(chars[start:idx]), cur_attr))
+            start = idx
+            cur_attr = attrs[idx]
+    segments.append(("".join(chars[start:]), cur_attr))
+    return segments
+
+def update_reactive_state(frames, synth_bus, drum_out, mixed, pending_trigs):
+    if frames <= 0:
+        return
+    decay = float(np.exp(-frames / (SAMPLE_RATE * 0.18)))
+    synth_level = clamp(float(np.sqrt(np.mean(np.square(synth_bus)))) * 3.2, 0.0, 1.0)
+    drum_level = clamp(float(np.sqrt(np.mean(np.square(drum_out)))) * 4.5, 0.0, 1.0)
+    master_level = clamp(float(np.sqrt(np.mean(np.square(mixed)))) * 3.2, 0.0, 1.0)
+    with synth_lock:
+        note_level = clamp(float(synth["env"]), 0.0, 1.0)
+
+    with reactive_lock:
+        for key in reactive_state:
+            reactive_state[key] *= decay
+        reactive_state["synth"] = max(reactive_state["synth"], synth_level)
+        reactive_state["drums"] = max(reactive_state["drums"], drum_level)
+        reactive_state["master"] = max(reactive_state["master"], master_level)
+        reactive_state["note"] = max(reactive_state["note"], note_level)
+        if pending_trigs[0]:
+            reactive_state["kick"] = 1.0
+        if pending_trigs[1] or pending_trigs[2]:
+            reactive_state["snare"] = 1.0
+        if pending_trigs[3] or pending_trigs[5]:
+            reactive_state["hat"] = 1.0
+
 def render_scope(samples, width, height):
     dw, dh = width * 2, height * 4
     idx = np.linspace(0, len(samples)-1, dw).astype(int)
@@ -1452,6 +1641,117 @@ def render_scope(samples, width, height):
 
     return ["".join(chr(BRAILLE_BASE|grid[r][c]) for c in range(width))
             for r in range(height)]
+
+def render_camera_visual(width, height, style_idx, depth, C, scope_attr, B, DIM):
+    ensure_camera_stream_running()
+    with camera_lock:
+        gray = None if camera_state["gray"] is None else camera_state["gray"].copy()
+        err = camera_state["error"]
+    with reactive_lock:
+        rx = reactive_state.copy()
+    if gray is None or gray.size == 0:
+        msg = short_label(err or "Starting camera...", max(1, width - 2))
+        lines = [" " * width for _ in range(height)]
+        if height > 0:
+            row = height // 2
+            pad = max(0, (width - len(msg)) // 2)
+            lines[row] = (" " * pad + msg)[:width].ljust(width)
+        return lines
+
+    y_idx = np.linspace(0, gray.shape[0] - 1, max(1, height)).astype(int)
+    x_idx = np.linspace(0, gray.shape[1] - 1, max(1, width)).astype(int)
+    small = gray[np.ix_(y_idx, x_idx)].astype(np.float32) / 255.0
+    style_idx = int(clamp(style_idx, 0, len(CAMERA_REACTIVE_STYLES) - 1))
+    depth = clamp(depth, 0.0, 1.0)
+    kick = rx["kick"] * depth
+    synth_amt = rx["synth"] * depth
+    drums = rx["drums"] * depth
+    note_amt = rx["note"] * depth
+    hat = rx["hat"] * depth
+    master = rx["master"] * depth
+    t = time.time()
+
+    base_attr = scope_attr
+    hi_attr = (C[6] | B)
+    alt_attr = (C[7] | B)
+    hot_attr = (C[9] | B)
+    cool_attr = (C[5] | B)
+    chars_small = small.copy()
+    attrs = np.full((small.shape[0], small.shape[1]), base_attr, dtype=object)
+    ramp = np.array(list(" .:-=+*#%@"))
+
+    if style_idx == 1:
+        chars_small = np.clip(chars_small + kick * 0.35, 0.0, 1.0)
+        if kick > 0.08:
+            attrs[:,:] = hi_attr if kick < 0.55 else hot_attr
+    elif style_idx == 2:
+        band = max(1, int(width * (0.12 + 0.25 * synth_amt)))
+        mid = width // 2
+        lo = max(0, mid - band)
+        hi = min(width, mid + band)
+        attrs[:, lo:hi] = cool_attr
+        chars_small[:, lo:hi] = np.clip(chars_small[:, lo:hi] + synth_amt * 0.28 + note_amt * 0.22, 0.0, 1.0)
+    elif style_idx == 3:
+        chars_small = np.where(drums > 0.16, 1.0 - chars_small * (0.65 - drums * 0.2), chars_small)
+        if drums > 0.12:
+            attrs[:,:] = hi_attr
+    elif style_idx == 4:
+        scan_x = int(((t * 9.0) + kick * 12.0) % max(1, width))
+        span = max(1, int(2 + master * 8))
+        lo = max(0, scan_x - span)
+        hi = min(width, scan_x + span + 1)
+        attrs[:, lo:hi] = alt_attr
+        chars_small[:, lo:hi] = np.clip(chars_small[:, lo:hi] + 0.25 + synth_amt * 0.3, 0.0, 1.0)
+    elif style_idx == 5:
+        edge = np.abs(np.diff(chars_small, axis=1, prepend=chars_small[:, :1]))
+        chars_small = np.clip(chars_small * 0.35 + edge * (1.2 + kick * 1.5), 0.0, 1.0)
+        attrs[edge > (0.18 - kick * 0.08)] = hot_attr if kick > 0.2 else hi_attr
+        ramp = np.array(list(" .'^:!*ox%#@"))
+    elif style_idx == 6:
+        shift = int(round((kick * 5.0) + (drums * 2.0)))
+        if shift > 0:
+            for row in range(chars_small.shape[0]):
+                chars_small[row] = np.roll(chars_small[row], shift if row % 2 == 0 else -shift)
+        attrs[::2, :] = alt_attr if kick > 0.1 else base_attr
+    elif style_idx == 7:
+        levels_q = max(2, int(3 + note_amt * 5 + synth_amt * 3))
+        chars_small = np.floor(chars_small * levels_q) / levels_q
+        attrs[chars_small > 0.55] = cool_attr
+        ramp = np.array(list("  .:=+*#%@"))
+    elif style_idx == 8:
+        chars_small = np.clip(chars_small + kick * 0.32 + drums * 0.18, 0.0, 1.0)
+        attrs[chars_small > 0.72] = hot_attr
+        attrs[(chars_small > 0.46) & (chars_small <= 0.72)] = hi_attr
+        ramp = np.array(list(" .,:;irsXA253hMHGS#9B&@"))
+    elif style_idx == 9:
+        chars_small = np.clip(chars_small * (0.85 + synth_amt * 0.25) + hat * 0.12, 0.0, 1.0)
+        attrs[chars_small > 0.62] = alt_attr
+        attrs[chars_small > 0.82] = cool_attr
+        ramp = np.array(list("  .-~=+*#%@"))
+    elif style_idx == 10:
+        third = max(1, width // 3)
+        attrs[:, :third] = alt_attr
+        attrs[:, third:third*2] = cool_attr
+        attrs[:, third*2:] = hi_attr
+        if synth_amt > 0.1:
+            attrs[:, max(0, width//2 - 2):min(width, width//2 + 2)] = hot_attr
+        chars_small = np.clip(chars_small + master * 0.12, 0.0, 1.0)
+    elif style_idx == 11:
+        cols = np.linspace(0, 1, width, dtype=np.float32)
+        rain = (np.sin(cols * 19.0 + t * (6.0 + drums * 5.0)) * 0.5 + 0.5) * (0.25 + master * 0.55)
+        chars_small = np.clip(chars_small * 0.5 + rain[None, :], 0.0, 1.0)
+        attrs[chars_small > 0.58] = cool_attr
+        attrs[chars_small > 0.8] = hi_attr
+        ramp = np.array(list(" .`:,;1!i><+*#%@"))
+
+    levels = (chars_small * (len(ramp) - 1)).astype(int)
+    levels = np.clip(levels, 0, len(ramp) - 1)
+    out_rows = []
+    for row_idx in range(levels.shape[0]):
+        row_chars = [str(ch) for ch in ramp[levels[row_idx]]]
+        row_attrs = list(attrs[row_idx])
+        out_rows.append(compress_visual_segments(row_chars, row_attrs))
+    return out_rows
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI HELPERS
@@ -1551,15 +1851,15 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
             ([",", ".", ";", "'"], "Adjust LFO rate and depth."),
             (["p", "-", "=", "_", "+"], "Toggle filter, adjust cutoff and resonance."),
             (["D", "F", "J", "K", "N", "M", "V", "B"], "Drive, delay mix, feedback, and delay time."),
-            (["S + ←→"], "In settings, adjust warmth, air, and reverb."),
+            (["S + ←→"], "In settings, adjust visuals, camera-reactive styles, warmth, air, and reverb."),
         ]),
         ("LOOP + DRUMS", [
             (["R", "T", "Y", "P", "U"], "Record, overdub, undo last overdub layer, toggle playback, or clear the loop."),
             (["G"], "Start or stop global mix recording to a WAV file."),
             (["TAB"], "Switch between synth focus and drum sequencer focus."),
             (["←", "→", "↑", "↓"], "Move around the drum grid while sequencer focus is active."),
-            (["SPC", "r", "c", "C", "1", "2"], "Toggle step, run, clear row, clear all, or load a 32-step pattern."),
-            (["S"], "Open settings for synth, MIDI device selection, note remaps, and pad/knob learn."),
+            (["SPC", "r", "c", "C", "1", "2"], "Toggle step, run, clear row/all with double-press confirm, or load a 32-step pattern."),
+            (["S"], "Open settings for synth, camera FX, MIDI device selection, note remaps, and pad/knob learn."),
         ]),
     ]
 
@@ -1594,7 +1894,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
         safe_addstr(scr, goal_y + i, left_x + 6, line, C[6])
 
 def settings_row_count(page):
-    return [13, 9, 8, 7][page]
+    return [14, 7, 9, 8, 7][page]
 
 def selected_midi_bind_target_locked():
     return MIDI_BIND_TARGETS[midi["learn_target_index"]]
@@ -1644,6 +1944,9 @@ def draw(stdscr):
     settings_open = False
     settings_page = 0
     settings_cursor = 0
+    drum_clear_confirm = None
+    drum_notice = ""
+    drum_notice_until = 0.0
 
     with midi_lock:
         refresh_midi_devices_locked()
@@ -1655,6 +1958,11 @@ def draw(stdscr):
 
             if ch == ord('H'):
                 help_until = now + HELP_TIMEOUT
+
+            if drum_notice_until and now >= drum_notice_until:
+                drum_notice = ""
+                drum_notice_until = 0.0
+                drum_clear_confirm = None
 
             # auto-release: curses has no keyup, so we release after timeout
             if held_note is not None and (now - last_note_t) > NOTE_TIMEOUT:
@@ -1672,6 +1980,8 @@ def draw(stdscr):
                     settings_open = False
                 elif ch in (ord(' '), ord('\n'), 10, 13):
                     if settings_page == 1:
+                        pass
+                    elif settings_page == 2:
                         if settings_cursor == 1:
                             with midi_lock:
                                 midi["enabled"] = not midi["enabled"]
@@ -1680,7 +1990,7 @@ def draw(stdscr):
                             with midi_lock:
                                 refresh_midi_devices_locked()
                             reopen_midi_input()
-                    elif settings_page == 2:
+                    elif settings_page == 3:
                         with midi_lock:
                             if settings_cursor == 2:
                                 midi["learn_mode"] = "off" if midi["learn_mode"] == "note_src" else "note_src"
@@ -1690,7 +2000,7 @@ def draw(stdscr):
                             elif settings_cursor == 5:
                                 midi["note_map"].pop(int(midi["note_edit_in"]), None)
                                 midi["status"] = f"Cleared map for {midi_to_name(midi['note_edit_in'])}"
-                    elif settings_page == 3:
+                    elif settings_page == 4:
                         with midi_lock:
                             if settings_cursor == 2:
                                 midi["learn_mode"] = "off" if midi["learn_mode"] == "bind" else "bind"
@@ -1716,38 +2026,47 @@ def draw(stdscr):
                                 ui_state["theme"] = (ui_state["theme"] + delta) % len(THEME_NAMES)
                         elif settings_cursor == 2:
                             with ui_lock:
-                                ui_state["scope_show_drums"] = not ui_state["scope_show_drums"]
+                                ui_state["visual_mode"] = (ui_state["visual_mode"] + delta) % len(VISUAL_MODES)
                         elif settings_cursor == 3:
+                            with ui_lock:
+                                ui_state["scope_show_drums"] = not ui_state["scope_show_drums"]
+                        elif settings_cursor == 4:
                             with drum_lock:
                                 drum["bank"] = (drum["bank"] + delta) % len(DRUM_BANKS)
-                        elif settings_cursor == 4:
-                            with synth_lock:
-                                synth["voices"] = int(clamp(synth["voices"] + delta, 1, MAX_VOICES))
                         elif settings_cursor == 5:
                             with synth_lock:
-                                synth["active_osc"] = (synth["active_osc"] + delta) % 2
+                                synth["voices"] = int(clamp(synth["voices"] + delta, 1, MAX_VOICES))
                         elif settings_cursor == 6:
                             with synth_lock:
-                                active_osc_locked()["waveform"] = (active_osc_locked()["waveform"] + delta) % len(WAVEFORMS)
+                                synth["active_osc"] = (synth["active_osc"] + delta) % 2
                         elif settings_cursor == 7:
                             with synth_lock:
-                                active_osc_locked()["level"] = clamp(active_osc_locked()["level"] + delta * 0.05, 0.0, 1.0)
+                                active_osc_locked()["waveform"] = (active_osc_locked()["waveform"] + delta) % len(WAVEFORMS)
                         elif settings_cursor == 8:
                             with synth_lock:
-                                active_osc_locked()["octave"] = int(clamp(active_osc_locked()["octave"] + delta, -2, 2))
+                                active_osc_locked()["level"] = clamp(active_osc_locked()["level"] + delta * 0.05, 0.0, 1.0)
                         elif settings_cursor == 9:
                             with synth_lock:
-                                active_osc_locked()["detune_cents"] = clamp(active_osc_locked()["detune_cents"] + delta * 2.0, -24.0, 24.0)
+                                active_osc_locked()["octave"] = int(clamp(active_osc_locked()["octave"] + delta, -2, 2))
                         elif settings_cursor == 10:
                             with synth_lock:
-                                synth["fx_warmth"] = clamp(synth["fx_warmth"] + delta * 0.05, 0.0, 1.0)
+                                active_osc_locked()["detune_cents"] = clamp(active_osc_locked()["detune_cents"] + delta * 2.0, -24.0, 24.0)
                         elif settings_cursor == 11:
                             with synth_lock:
-                                synth["fx_air"] = clamp(synth["fx_air"] + delta * 0.05, 0.0, 1.0)
+                                synth["fx_warmth"] = clamp(synth["fx_warmth"] + delta * 0.05, 0.0, 1.0)
                         elif settings_cursor == 12:
+                            with synth_lock:
+                                synth["fx_air"] = clamp(synth["fx_air"] + delta * 0.05, 0.0, 1.0)
+                        elif settings_cursor == 13:
                             with synth_lock:
                                 synth["fx_reverb"] = clamp(synth["fx_reverb"] + delta * 0.05, 0.0, 1.0)
                     elif settings_page == 1:
+                        with ui_lock:
+                            if settings_cursor == 1:
+                                ui_state["camera_style"] = (ui_state["camera_style"] + delta) % len(CAMERA_REACTIVE_STYLES)
+                            elif settings_cursor == 2:
+                                ui_state["camera_reactivity"] = clamp(ui_state["camera_reactivity"] + delta * 0.05, 0.0, 1.0)
+                    elif settings_page == 2:
                         midi_reopen = False
                         clear_notes = False
                         with midi_lock:
@@ -1774,7 +2093,7 @@ def draw(stdscr):
                             clear_midi_note_state()
                         if midi_reopen:
                             reopen_midi_input()
-                    elif settings_page == 2:
+                    elif settings_page == 3:
                         with midi_lock:
                             if settings_cursor == 1:
                                 midi["note_edit_in"] = int(clamp(midi["note_edit_in"] + delta, 0, 127))
@@ -1788,7 +2107,7 @@ def draw(stdscr):
                             elif settings_cursor == 5:
                                 midi["note_map"].pop(int(midi["note_edit_in"]), None)
                                 midi["status"] = f"Cleared map for {midi_to_name(midi['note_edit_in'])}"
-                    elif settings_page == 3:
+                    elif settings_page == 4:
                         with midi_lock:
                             if settings_cursor == 1:
                                 midi["learn_target_index"] = (midi["learn_target_index"] + delta) % len(MIDI_BIND_TARGETS)
@@ -1933,39 +2252,71 @@ def draw(stdscr):
                 else:  # focus == "seq"
                     if ch == ord('q'): break
                     elif ch == curses.KEY_UP:
+                        drum_clear_confirm = None
                         seq_cursor_v = (seq_cursor_v - 1) % NUM_DRUM_VOICES
                     elif ch == curses.KEY_DOWN:
+                        drum_clear_confirm = None
                         seq_cursor_v = (seq_cursor_v + 1) % NUM_DRUM_VOICES
                     elif ch == curses.KEY_LEFT:
+                        drum_clear_confirm = None
                         seq_cursor_s = (seq_cursor_s - 1) % NUM_STEPS
                     elif ch == curses.KEY_RIGHT:
+                        drum_clear_confirm = None
                         seq_cursor_s = (seq_cursor_s + 1) % NUM_STEPS
                     elif ch == ord(' '):
+                        drum_clear_confirm = None
                         with drum_lock:
                             drum["steps"][seq_cursor_v][seq_cursor_s] = \
                                 not drum["steps"][seq_cursor_v][seq_cursor_s]
                     elif ch == ord('\n') or ch == ord('r'):
+                        drum_clear_confirm = None
                         with drum_lock: drum["running"] = not drum["running"]
                     elif ch == ord('c'):
-                        with drum_lock: drum["steps"][seq_cursor_v] = [False]*NUM_STEPS
+                        if drum_clear_confirm == ("row", seq_cursor_v) and now < drum_notice_until:
+                            with drum_lock:
+                                drum["steps"][seq_cursor_v] = [False]*NUM_STEPS
+                            drum_notice = f"Cleared {DRUM_NAMES[seq_cursor_v].strip()} row"
+                            drum_notice_until = now + 1.2
+                            drum_clear_confirm = None
+                        else:
+                            drum_clear_confirm = ("row", seq_cursor_v)
+                            drum_notice = f"Press c again to clear {DRUM_NAMES[seq_cursor_v].strip()} row"
+                            drum_notice_until = now + 1.2
                     elif ch == ord('C'):
-                        with drum_lock: drum["steps"] = [[False]*NUM_STEPS for _ in range(NUM_DRUM_VOICES)]
+                        if drum_clear_confirm == ("all", None) and now < drum_notice_until:
+                            with drum_lock:
+                                drum["steps"] = [[False]*NUM_STEPS for _ in range(NUM_DRUM_VOICES)]
+                            drum_notice = "Cleared all drum steps"
+                            drum_notice_until = now + 1.2
+                            drum_clear_confirm = None
+                        else:
+                            drum_clear_confirm = ("all", None)
+                            drum_notice = "Press Shift+C again to clear all drum steps"
+                            drum_notice_until = now + 1.2
                     elif ch == ord(','):
+                        drum_clear_confirm = None
                         with drum_lock: drum["bpm"] = clamp(drum["bpm"]-1, 40, 300)
                     elif ch == ord('.'):
+                        drum_clear_confirm = None
                         with drum_lock: drum["bpm"] = clamp(drum["bpm"]+1, 40, 300)
                     elif ch == ord('<'):
+                        drum_clear_confirm = None
                         with drum_lock: drum["bpm"] = clamp(drum["bpm"]-5, 40, 300)
                     elif ch == ord('>'):
+                        drum_clear_confirm = None
                         with drum_lock: drum["bpm"] = clamp(drum["bpm"]+5, 40, 300)
                     elif ch == ord('-'):
+                        drum_clear_confirm = None
                         with drum_lock: drum["vol"][seq_cursor_v]=clamp(drum["vol"][seq_cursor_v]-0.05,0,1)
                     elif ch == ord('='):
+                        drum_clear_confirm = None
                         with drum_lock: drum["vol"][seq_cursor_v]=clamp(drum["vol"][seq_cursor_v]+0.05,0,1)
                     elif ch == ord('1'):
+                        drum_clear_confirm = None
                         with drum_lock:
                             apply_drum_pattern_locked(0)
                     elif ch == ord('2'):
+                        drum_clear_confirm = None
                         with drum_lock:
                             apply_drum_pattern_locked(1)
 
@@ -2007,7 +2358,16 @@ def draw(stdscr):
 
             with ui_lock:
                 theme=ui_state["theme"]
+                visual_mode=ui_state["visual_mode"]
+                camera_style=ui_state["camera_style"]
+                camera_reactivity=ui_state["camera_reactivity"]
                 scope_show_drums=ui_state["scope_show_drums"]
+
+            with reactive_lock:
+                rx_master = reactive_state["master"]
+                rx_synth = reactive_state["synth"]
+                rx_drums = reactive_state["drums"]
+                rx_kick = reactive_state["kick"]
 
             with midi_lock:
                 midi_enabled = midi["enabled"]
@@ -2159,12 +2519,17 @@ def draw(stdscr):
             scope_bot = drum_top - 1
             sh        = max(1, scope_bot - scope_top)
 
-            safe_addstr(stdscr, scope_top, scope_x, "SCOPE " + "─"*(sw-6), C[2])
-            lines = render_scope(snap, sw, sh-1)
+            visual_title = "CAM" if visual_mode == 1 else "SCOPE"
+            safe_addstr(stdscr, scope_top, scope_x, visual_title + " " + "─"*(max(0, sw-len(visual_title)-1)), C[2])
+            if visual_mode == 1:
+                lines = render_camera_visual(sw, sh-1, camera_style, camera_reactivity, C, scope_attr, B, DIM)
+            else:
+                stop_camera_stream()
+                lines = render_scope(snap, sw, sh-1)
             for row, line in enumerate(lines):
-                safe_addstr(stdscr, scope_top+1+row, scope_x, line, scope_attr)
+                draw_visual_line(stdscr, scope_top+1+row, scope_x, line, scope_attr)
 
-            scope_lbl = "MIX" if scope_show_drums else "SYNTH"
+            scope_lbl = (f"CAM {camera_style:02d}" if visual_mode == 1 else ("MIX" if scope_show_drums else "SYNTH"))
             safe_addstr(stdscr, scope_top, max(scope_x + 7, w - 15), f"[{THEME_NAMES[theme]} {scope_lbl}]", scope_attr|B)
 
             # ══════════════════════════════════════
@@ -2185,6 +2550,8 @@ def draw(stdscr):
             safe_addstr(stdscr, drum_top, 36, "r=start/stop", C[6])
             if w > 60:
                 safe_addstr(stdscr, drum_top, 49, f"set:{d_bank_name}", C[6])
+            if drum_notice:
+                safe_addstr(stdscr, drum_top, max(58, w - len(drum_notice) - 2), drum_notice[:max(0, w-60)], C[6]|B)
 
             # step numbers header
             step_x0 = 6
@@ -2251,7 +2618,7 @@ def draw(stdscr):
 
             if settings_open:
                 box_w = min(68, max(38, w - 8))
-                box_h = 18 if settings_page == 0 else 14
+                box_h = 18 if settings_page == 0 else (15 if settings_page == 1 else 14)
                 box_x = max(2, (w - box_w) // 2)
                 box_y = max(2, (h - box_h) // 2)
                 draw_box(stdscr, box_y, box_x, box_w, box_h, f"SETTINGS {SETTINGS_PAGE_NAMES[settings_page]}", scope_attr|B)
@@ -2266,6 +2633,7 @@ def draw(stdscr):
                 if settings_page == 0:
                     rows.extend([
                         f"Theme        {THEME_NAMES[theme]}",
+                        f"Visuals      {VISUAL_MODES[visual_mode]}",
                         f"Scope source {'MIX' if scope_show_drums else 'SYNTH ONLY'}",
                         f"Drum set     {d_bank_name}",
                         f"Voices       {int(voices)}",
@@ -2280,6 +2648,15 @@ def draw(stdscr):
                     ])
                 elif settings_page == 1:
                     rows.extend([
+                        f"Cam style    {CAMERA_REACTIVE_STYLES[camera_style]}",
+                        f"Cam depth    {int(camera_reactivity * 100):3d}%",
+                        f"Kick pulse   {int(rx_kick * 100):3d}%",
+                        f"Synth glow   {int(rx_synth * 100):3d}%",
+                        f"Drum hit     {int(rx_drums * 100):3d}%",
+                        f"Master lvl   {int(rx_master * 100):3d}%",
+                    ])
+                elif settings_page == 2:
+                    rows.extend([
                         f"MIDI input   {'ON ' if midi_enabled else 'OFF'}",
                         f"Device       {short_label(midi_device_name or 'None', 42)}",
                         f"Refresh      {midi_device_count:2d} devices",
@@ -2289,7 +2666,7 @@ def draw(stdscr):
                         f"Remap next   Go to MIDI MAP / Learn bind",
                         f"Status       {short_label(midi_status, 42)}",
                     ])
-                elif settings_page == 2:
+                elif settings_page == 3:
                     rows.extend([
                         f"Source note  {midi_to_name(midi_note_edit_in):>3} ({midi_note_edit_in:03d})",
                         f"Learn src    {'ARMED' if midi_learn_mode == 'note_src' else 'OFF'}",
@@ -2320,6 +2697,7 @@ def draw(stdscr):
     finally:
         if global_rec["recording"]:
             stop_global_recording()
+        stop_camera_stream()
         with midi_lock:
             midi_port = midi["input_port"]
             midi["input_port"] = None

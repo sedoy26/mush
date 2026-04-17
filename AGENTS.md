@@ -37,6 +37,8 @@ Recent work completed in `synth.sh`:
 - changed global mix recording to write numbered `untiteled*.wav` files in the launch directory without overwriting older takes
 - added extra synth FX controls for warmth, air, and reverb in the settings panel
 - added paged settings support for MIDI input device selection, per-note remapping, and MIDI learn for pad/knob bindings
+- added an alternate camera visual mode that live-streams webcam frames via `ffmpeg` inside the synth view when selected in settings
+- added a camera FX settings page with multiple audio-reactive webcam rendering styles driven by kick, drums, synth, and master level
 
 ## Controls Added Recently
 
@@ -51,6 +53,8 @@ Recent work completed in `synth.sh`:
 - `G` start/stop global mix recording to a `.wav` file
 - `S` settings now also expose warmth / air / reverb amounts with arrow keys
 - `S` now opens paged settings for main synth options plus MIDI device, note map, and binding configuration
+- main settings now also let the user switch visuals between oscilloscope and camera mode
+- camera visuals can now be styled with multiple audio-reactive modes in settings
 
 ## Development Notes
 
