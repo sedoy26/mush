@@ -1,3 +1,5 @@
 agent.md
 wav/*
 !wav/demo.wav
+projects/*
+!projects/demo.mush
