@@ -8,7 +8,7 @@ PY_SCRIPT="$HOME/.mursynth.py"
 
 cat > "$PY_SCRIPT" << 'PYEOF'
 import curses, numpy as np, sounddevice as sd
-import os, shutil, subprocess, threading, time, textwrap, wave
+import json, os, shutil, subprocess, threading, time, textwrap, wave
 from collections import deque
 
 try:
@@ -45,6 +45,8 @@ MASTER_LIMIT_RELEASE = 0.08
 LOOP_UNDO_LIMIT = 12
 GLOBAL_REC_FILENAME = "untiteled.wav"
 WAV_DIRNAME = "wav"
+PROJECT_DIRNAME = "projects"
+PROJECT_FILE_EXT = ".mush"
 CAMERA_CAPTURE_FPS = 30
 CAMERA_OUTPUT_FPS = 12
 CAMERA_FRAME_WIDTH = 160
@@ -76,7 +78,7 @@ CAMERA_REACTIVE_STYLES = [
     "CHROMA SPLIT",
     "MATRIX BEAT",
 ]
-SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "SOUND DEVICE", "MIDI DEVICE", "MIDI NOTE", "MIDI MAP"]
+SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "SOUND DEVICE", "PROJECT", "MIDI DEVICE", "MIDI NOTE", "MIDI MAP"]
 MIDI_PAD_TARGETS = [
     ("pad_kick", "Pad Kick", "note"),
     ("pad_snare", "Pad Snare", "note"),
@@ -211,6 +213,14 @@ audio = {
     "status": "Audio idle",
 }
 audio_lock = threading.Lock()
+
+project = {
+    "files": [],
+    "selected_index": 0,
+    "target_name": "",
+    "status": "Project idle",
+}
+project_lock = threading.Lock()
 
 midi = {
     "enabled": False,
@@ -1910,7 +1920,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
         safe_addstr(scr, goal_y + i, left_x + 6, line, C[6])
 
 def settings_row_count(page):
-    return [14, 7, 7, 9, 8, 7][page]
+    return [14, 7, 7, 7, 9, 8, 7][page]
 
 def selected_midi_bind_target_locked():
     return MIDI_BIND_TARGETS[midi["learn_target_index"]]
@@ -2024,6 +2034,215 @@ def close_audio_stream(stream):
     except Exception:
         pass
 
+def next_project_filename(existing_names):
+    idx = 1
+    while True:
+        candidate = f"project-{idx:04d}{PROJECT_FILE_EXT}"
+        if candidate not in existing_names:
+            return candidate
+        idx += 1
+
+def refresh_project_files_locked():
+    project_dir = os.path.join(os.getcwd(), PROJECT_DIRNAME)
+    existing_names = []
+    if os.path.isdir(project_dir):
+        existing_names = sorted(name for name in os.listdir(project_dir) if name.endswith(PROJECT_FILE_EXT))
+    project["files"] = existing_names
+    target_name = project["target_name"]
+    if not target_name:
+        project["target_name"] = existing_names[0] if existing_names else next_project_filename(existing_names)
+    elif target_name not in existing_names and not target_name.endswith(PROJECT_FILE_EXT):
+        project["target_name"] = f"{target_name}{PROJECT_FILE_EXT}"
+    current_name = project["target_name"]
+    if current_name in existing_names:
+        project["selected_index"] = existing_names.index(current_name)
+    elif existing_names:
+        project["selected_index"] = 0
+    else:
+        project["selected_index"] = 0
+
+def selected_project_path_locked():
+    target_name = project["target_name"] or next_project_filename(project["files"])
+    return os.path.join(os.getcwd(), PROJECT_DIRNAME, target_name)
+
+def capture_project_state():
+    with synth_lock:
+        synth_state = {
+            "volume": synth["volume"],
+            "base_midi": synth["base_midi"],
+            "gate_mode": synth["gate_mode"],
+            "attack": synth["attack"],
+            "release": synth["release"],
+            "lfo_wave": synth["lfo_wave"],
+            "lfo_rate": synth["lfo_rate"],
+            "lfo_depth": synth["lfo_depth"],
+            "lfo_target": synth["lfo_target"],
+            "filter_on": synth["filter_on"],
+            "cutoff": synth["cutoff"],
+            "resonance": synth["resonance"],
+            "voices": synth["voices"],
+            "fx_drive": synth["fx_drive"],
+            "fx_delay_mix": synth["fx_delay_mix"],
+            "fx_delay_feedback": synth["fx_delay_feedback"],
+            "fx_delay_time": synth["fx_delay_time"],
+            "fx_warmth": synth["fx_warmth"],
+            "fx_air": synth["fx_air"],
+            "fx_reverb": synth["fx_reverb"],
+            "active_osc": synth["active_osc"],
+            "oscillators": [
+                {
+                    "waveform": osc["waveform"],
+                    "level": osc["level"],
+                    "octave": osc["octave"],
+                    "detune_cents": osc["detune_cents"],
+                }
+                for osc in synth["oscillators"]
+            ],
+        }
+    with drum_lock:
+        drum_state = {
+            "steps": [[bool(step) for step in row] for row in drum["steps"]],
+            "vol": [float(level) for level in drum["vol"]],
+            "bpm": float(drum["bpm"]),
+            "running": bool(drum["running"]),
+            "bank": int(drum["bank"]),
+        }
+    with ui_lock:
+        ui_snapshot = dict(ui_state)
+    with audio_lock:
+        audio_state = {
+            "input_name": audio["input_name"],
+            "output_name": audio["output_name"],
+        }
+    with midi_lock:
+        midi_state = {
+            "enabled": bool(midi["enabled"]),
+            "device_name": midi["device_name"],
+            "channel": int(midi["channel"]),
+            "note_input": bool(midi["note_input"]),
+            "pad_input": bool(midi["pad_input"]),
+            "learn_target_index": int(midi["learn_target_index"]),
+            "note_map": {str(src): int(dst) for src, dst in midi["note_map"].items()},
+            "note_bindings": {target_id: value for target_id, value in midi["note_bindings"].items()},
+            "cc_bindings": {target_id: value for target_id, value in midi["cc_bindings"].items()},
+        }
+    return {
+        "format": "mush-project",
+        "version": 1,
+        "saved_at": time.time(),
+        "synth": synth_state,
+        "drums": drum_state,
+        "ui": ui_snapshot,
+        "audio": audio_state,
+        "midi": midi_state,
+    }
+
+def apply_project_state(project_data):
+    synth_state = project_data.get("synth", {})
+    drum_state = project_data.get("drums", {})
+    ui_snapshot = project_data.get("ui", {})
+    audio_state = project_data.get("audio", {})
+    midi_state = project_data.get("midi", {})
+
+    with synth_lock:
+        for key in (
+            "volume", "base_midi", "gate_mode", "attack", "release",
+            "lfo_wave", "lfo_rate", "lfo_depth", "lfo_target",
+            "filter_on", "cutoff", "resonance", "voices",
+            "fx_drive", "fx_delay_mix", "fx_delay_feedback", "fx_delay_time",
+            "fx_warmth", "fx_air", "fx_reverb", "active_osc",
+        ):
+            if key in synth_state:
+                synth[key] = synth_state[key]
+        loaded_oscillators = synth_state.get("oscillators", [])
+        for osc_idx, osc_state in enumerate(loaded_oscillators[:len(synth["oscillators"])]):
+            for key in ("waveform", "level", "octave", "detune_cents"):
+                if key in osc_state:
+                    synth["oscillators"][osc_idx][key] = osc_state[key]
+        sync_pitch_locked()
+
+    with drum_lock:
+        loaded_steps = drum_state.get("steps")
+        if isinstance(loaded_steps, list) and len(loaded_steps) == NUM_DRUM_VOICES:
+            drum["steps"] = [
+                [bool(row[step_idx]) if step_idx < len(row) else False for step_idx in range(NUM_STEPS)]
+                for row in loaded_steps
+            ]
+        loaded_vol = drum_state.get("vol")
+        if isinstance(loaded_vol, list) and len(loaded_vol) == NUM_DRUM_VOICES:
+            drum["vol"] = [clamp(float(level), 0.0, 1.0) for level in loaded_vol]
+        if "bpm" in drum_state:
+            drum["bpm"] = clamp(float(drum_state["bpm"]), 40.0, 300.0)
+        if "running" in drum_state:
+            drum["running"] = bool(drum_state["running"])
+        if "bank" in drum_state:
+            drum["bank"] = int(clamp(int(drum_state["bank"]), 0, len(DRUM_BANKS) - 1))
+        drum["cur_step"] = 0
+
+    with ui_lock:
+        for key in ("theme", "visual_mode", "camera_style", "camera_reactivity", "scope_show_drums"):
+            if key in ui_snapshot:
+                ui_state[key] = ui_snapshot[key]
+
+    audio_reopen = False
+    with audio_lock:
+        refresh_audio_devices_locked()
+        output_name = audio_state.get("output_name", "")
+        input_name = audio_state.get("input_name", "")
+        if output_name:
+            for index, device_info in enumerate(audio["outputs"]):
+                if device_info["name"] == output_name:
+                    audio["output_index"] = index
+                    audio["output_name"] = device_info["name"]
+                    audio_reopen = True
+                    break
+        if input_name:
+            for index, device_info in enumerate(audio["inputs"]):
+                if device_info["name"] == input_name:
+                    audio["input_index"] = index
+                    audio["input_name"] = device_info["name"]
+                    break
+
+    with midi_lock:
+        refresh_midi_devices_locked()
+        for key in ("enabled", "device_name", "channel", "note_input", "pad_input", "learn_target_index"):
+            if key in midi_state:
+                midi[key] = midi_state[key]
+        midi["note_map"] = {int(src): int(dst) for src, dst in midi_state.get("note_map", {}).items()}
+        for binding_key in ("note_bindings", "cc_bindings"):
+            binding_values = midi_state.get(binding_key, {})
+            if isinstance(binding_values, dict):
+                for target_id, value in binding_values.items():
+                    if target_id in midi[binding_key]:
+                        midi[binding_key][target_id] = None if value is None else int(value)
+        midi["learn_mode"] = "off"
+
+    return audio_reopen
+
+def save_project_locked():
+    refresh_project_files_locked()
+    path = selected_project_path_locked()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as project_file:
+        json.dump(capture_project_state(), project_file, indent=2, sort_keys=True)
+    project["status"] = f"Saved {os.path.basename(path)}"
+    project["target_name"] = os.path.basename(path)
+    refresh_project_files_locked()
+    return path
+
+def load_project_locked():
+    refresh_project_files_locked()
+    path = selected_project_path_locked()
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Project not found: {os.path.basename(path)}")
+    with open(path, "r", encoding="utf-8") as project_file:
+        project_data = json.load(project_file)
+    audio_reopen = apply_project_state(project_data)
+    project["status"] = f"Loaded {os.path.basename(path)}"
+    project["target_name"] = os.path.basename(path)
+    refresh_project_files_locked()
+    return path, audio_reopen
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN DRAW LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2072,6 +2291,9 @@ def draw(stdscr):
     with audio_lock:
         refresh_audio_devices_locked()
 
+    with project_lock:
+        refresh_project_files_locked()
+
     with midi_lock:
         refresh_midi_devices_locked()
 
@@ -2115,6 +2337,26 @@ def draw(stdscr):
                             close_audio_stream(stream)
                             stream = open_audio_stream()
                     elif settings_page == 3:
+                        audio_reopen = False
+                        midi_reopen = False
+                        try:
+                            with project_lock:
+                                if settings_cursor == 2:
+                                    refresh_project_files_locked()
+                                elif settings_cursor == 3:
+                                    save_project_locked()
+                                elif settings_cursor == 4:
+                                    _, audio_reopen = load_project_locked()
+                                    midi_reopen = True
+                        except Exception as exc:
+                            with project_lock:
+                                project["status"] = short_label(str(exc), 42)
+                        if audio_reopen:
+                            close_audio_stream(stream)
+                            stream = open_audio_stream()
+                        if midi_reopen:
+                            reopen_midi_input()
+                    elif settings_page == 4:
                         if settings_cursor == 1:
                             with midi_lock:
                                 midi["enabled"] = not midi["enabled"]
@@ -2123,7 +2365,7 @@ def draw(stdscr):
                             with midi_lock:
                                 refresh_midi_devices_locked()
                             reopen_midi_input()
-                    elif settings_page == 4:
+                    elif settings_page == 5:
                         with midi_lock:
                             if settings_cursor == 2:
                                 midi["learn_mode"] = "off" if midi["learn_mode"] == "note_src" else "note_src"
@@ -2133,7 +2375,7 @@ def draw(stdscr):
                             elif settings_cursor == 5:
                                 midi["note_map"].pop(int(midi["note_edit_in"]), None)
                                 midi["status"] = f"Cleared map for {midi_to_name(midi['note_edit_in'])}"
-                    elif settings_page == 5:
+                    elif settings_page == 6:
                         with midi_lock:
                             if settings_cursor == 2:
                                 midi["learn_mode"] = "off" if midi["learn_mode"] == "bind" else "bind"
@@ -2217,6 +2459,27 @@ def draw(stdscr):
                             close_audio_stream(stream)
                             stream = open_audio_stream()
                     elif settings_page == 3:
+                        with project_lock:
+                            refresh_project_files_locked()
+                            if settings_cursor == 1:
+                                project_names = project["files"][:]
+                                if project["target_name"] not in project_names:
+                                    project_names.append(project["target_name"])
+                                project_names = sorted(name for name in project_names if name)
+                                if project_names:
+                                    current_name = project["target_name"] or project_names[0]
+                                    current_index = project_names.index(current_name) if current_name in project_names else 0
+                                    next_index = (current_index + delta) % len(project_names)
+                                    project["target_name"] = project_names[next_index]
+                                    if project["target_name"] in project["files"]:
+                                        project["selected_index"] = project["files"].index(project["target_name"])
+                            elif settings_cursor == 2:
+                                refresh_project_files_locked()
+                            elif settings_cursor == 5:
+                                existing_names = project["files"][:]
+                                project["target_name"] = next_project_filename(existing_names)
+                                project["status"] = f"Next save slot: {project['target_name']}"
+                    elif settings_page == 4:
                         midi_reopen = False
                         clear_notes = False
                         with midi_lock:
@@ -2243,7 +2506,7 @@ def draw(stdscr):
                             clear_midi_note_state()
                         if midi_reopen:
                             reopen_midi_input()
-                    elif settings_page == 4:
+                    elif settings_page == 5:
                         with midi_lock:
                             if settings_cursor == 1:
                                 midi["note_edit_in"] = int(clamp(midi["note_edit_in"] + delta, 0, 127))
@@ -2257,7 +2520,7 @@ def draw(stdscr):
                             elif settings_cursor == 5:
                                 midi["note_map"].pop(int(midi["note_edit_in"]), None)
                                 midi["status"] = f"Cleared map for {midi_to_name(midi['note_edit_in'])}"
-                    elif settings_page == 5:
+                    elif settings_page == 6:
                         with midi_lock:
                             if settings_cursor == 1:
                                 midi["learn_target_index"] = (midi["learn_target_index"] + delta) % len(MIDI_BIND_TARGETS)
@@ -2520,6 +2783,11 @@ def draw(stdscr):
                 audio_input_count = len(audio["inputs"])
                 audio_status = audio["status"]
 
+            with project_lock:
+                project_target_name = project["target_name"]
+                project_file_count = len(project["files"])
+                project_status = project["status"]
+
             with reactive_lock:
                 rx_master = reactive_state["master"]
                 rx_synth = reactive_state["synth"]
@@ -2777,7 +3045,7 @@ def draw(stdscr):
 
             if settings_open:
                 box_w = min(68, max(38, w - 8))
-                box_h = 19 if settings_page == 0 else (15 if settings_page in (1, 2) else 14)
+                box_h = 19 if settings_page == 0 else (15 if settings_page in (1, 2, 3) else 14)
                 box_x = max(2, (w - box_w) // 2)
                 box_y = max(2, (h - box_h) // 2)
                 draw_box(stdscr, box_y, box_x, box_w, box_h, f"SETTINGS {SETTINGS_PAGE_NAMES[settings_page]}", scope_attr|B)
@@ -2825,6 +3093,15 @@ def draw(stdscr):
                     ])
                 elif settings_page == 3:
                     rows.extend([
+                        f"Project file {short_label(project_target_name or next_project_filename([]), 42)}",
+                        f"Refresh      {project_file_count:2d} projects",
+                        f"Save project Write current setup to selected file",
+                        f"Load project Restore selected project file",
+                        f"New slot     ←→ picks next numbered save slot",
+                        f"Status       {short_label(project_status, 42)}",
+                    ])
+                elif settings_page == 4:
+                    rows.extend([
                         f"MIDI input   {'ON ' if midi_enabled else 'OFF'}",
                         f"Device       {short_label(midi_device_name or 'None', 42)}",
                         f"Refresh      {midi_device_count:2d} devices",
@@ -2834,7 +3111,7 @@ def draw(stdscr):
                         f"Remap next   Go to MIDI MAP / Learn bind",
                         f"Status       {short_label(midi_status, 42)}",
                     ])
-                elif settings_page == 4:
+                elif settings_page == 5:
                     rows.extend([
                         f"Source note  {midi_to_name(midi_note_edit_in):>3} ({midi_note_edit_in:03d})",
                         f"Learn src    {'ARMED' if midi_learn_mode == 'note_src' else 'OFF'}",
