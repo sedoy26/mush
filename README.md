@@ -82,6 +82,8 @@ If you load the demo project on another machine, `mush` uses that machine's curr
 
 ## Main controls
 
+![mush help overlay](help.png)
+
 - `TAB` — switch between synth focus and drum focus
 - `S` — open settings
 - `H` — show help
