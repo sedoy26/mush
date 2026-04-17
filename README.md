@@ -1,5 +1,14 @@
 # mush
 
+```text
+███╗   ███╗██╗   ██╗   ███████╗██╗  ██╗
+████╗ ████║██║   ██║   ██╔════╝██║  ██║
+██╔████╔██║██║   ██║   ███████╗███████║
+██║╚██╔╝██║██║   ██║   ╚════██║██╔══██║
+██║ ╚═╝ ██║╚██████╔╝██╗███████║██║  ██║
+╚═╝     ╚═╝ ╚═════╝ ╚═╝╚══════╝╚═╝  ╚═╝
+```
+
 `mush` is a terminal synthesizer and drum machine launched by `mu.sh`.
 
 It runs as a single shell script that writes an embedded Python app to your home directory, creates a local virtualenv on first run, installs the required Python packages, and starts an interactive curses-based instrument.
