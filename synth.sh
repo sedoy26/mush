@@ -44,6 +44,7 @@ MASTER_LIMIT_ATTACK = 0.002
 MASTER_LIMIT_RELEASE = 0.08
 LOOP_UNDO_LIMIT = 12
 GLOBAL_REC_FILENAME = "untiteled.wav"
+WAV_DIRNAME = "wav"
 CAMERA_CAPTURE_FPS = 30
 CAMERA_OUTPUT_FPS = 12
 CAMERA_FRAME_WIDTH = 160
@@ -998,13 +999,15 @@ def start_global_recording():
 
 def next_global_recording_path():
     base, ext = os.path.splitext(GLOBAL_REC_FILENAME)
-    path = os.path.join(os.getcwd(), GLOBAL_REC_FILENAME)
+    wav_dir = os.path.join(os.getcwd(), WAV_DIRNAME)
+    os.makedirs(wav_dir, exist_ok=True)
+    path = os.path.join(wav_dir, GLOBAL_REC_FILENAME)
     if not os.path.exists(path):
         return path
 
     idx = 1
     while True:
-        candidate = os.path.join(os.getcwd(), f"{base}-{idx:04d}{ext}")
+        candidate = os.path.join(wav_dir, f"{base}-{idx:04d}{ext}")
         if not os.path.exists(candidate):
             return candidate
         idx += 1
