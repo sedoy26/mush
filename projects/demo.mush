@@ -1,7 +1,7 @@
 {
   "audio": {
-    "input_name": "Arctis Nova 3P Wireless",
-    "output_name": "SBH20"
+    "input_name": "__DEFAULT_OS_INPUT__",
+    "output_name": "__DEFAULT_OS_OUTPUT__"
   },
   "drums": {
     "bank": 6,

@@ -47,6 +47,8 @@ GLOBAL_REC_FILENAME = "mush.wav"
 WAV_DIRNAME = "wav"
 PROJECT_DIRNAME = "projects"
 PROJECT_FILE_EXT = ".mush"
+AUDIO_DEFAULT_OUTPUT_TOKEN = "__DEFAULT_OS_OUTPUT__"
+AUDIO_DEFAULT_INPUT_TOKEN = "__DEFAULT_OS_INPUT__"
 CAMERA_CAPTURE_FPS = 30
 CAMERA_OUTPUT_FPS = 12
 CAMERA_FRAME_WIDTH = 160
@@ -208,8 +210,10 @@ audio = {
     "outputs": [],
     "input_index": 0,
     "output_index": 0,
-    "input_name": "",
-    "output_name": "",
+    "input_name": AUDIO_DEFAULT_INPUT_TOKEN,
+    "output_name": AUDIO_DEFAULT_OUTPUT_TOKEN,
+    "input_display_name": "Default OS Input",
+    "output_display_name": "Default OS Output",
     "status": "Audio idle",
 }
 audio_lock = threading.Lock()
@@ -1940,8 +1944,10 @@ def refresh_audio_devices_locked():
         audio["outputs"] = []
         audio["input_index"] = 0
         audio["output_index"] = 0
-        audio["input_name"] = ""
-        audio["output_name"] = ""
+        audio["input_name"] = AUDIO_DEFAULT_INPUT_TOKEN
+        audio["output_name"] = AUDIO_DEFAULT_OUTPUT_TOKEN
+        audio["input_display_name"] = "Default OS Input"
+        audio["output_display_name"] = "Default OS Output"
         audio["status"] = short_label(f"Audio query failed: {exc}", 42)
         return
 
@@ -1957,15 +1963,16 @@ def refresh_audio_devices_locked():
     audio["inputs"] = inputs
     audio["outputs"] = outputs
 
-    def sync_selection(devices_list, index_key, name_key, default_device_id):
+    def sync_selection(devices_list, index_key, name_key, display_key, default_token, default_label, default_device_id):
         current_name = audio[name_key]
         current_index = audio[index_key]
         selected_pos = None
         if devices_list:
-            for pos, device_info in enumerate(devices_list):
-                if current_name and device_info["name"] == current_name:
-                    selected_pos = pos
-                    break
+            if current_name != default_token:
+                for pos, device_info in enumerate(devices_list):
+                    if current_name and device_info["name"] == current_name:
+                        selected_pos = pos
+                        break
             if selected_pos is None:
                 for pos, device_info in enumerate(devices_list):
                     if device_info["id"] == default_device_id:
@@ -1974,13 +1981,19 @@ def refresh_audio_devices_locked():
             if selected_pos is None:
                 selected_pos = int(clamp(current_index, 0, len(devices_list) - 1))
             audio[index_key] = selected_pos
-            audio[name_key] = devices_list[selected_pos]["name"]
+            if current_name == default_token:
+                audio[name_key] = default_token
+                audio[display_key] = f"{default_label} ({devices_list[selected_pos]['name']})"
+            else:
+                audio[name_key] = devices_list[selected_pos]["name"]
+                audio[display_key] = devices_list[selected_pos]["name"]
         else:
             audio[index_key] = 0
-            audio[name_key] = ""
+            audio[name_key] = default_token
+            audio[display_key] = default_label
 
-    sync_selection(inputs, "input_index", "input_name", default_input)
-    sync_selection(outputs, "output_index", "output_name", default_output)
+    sync_selection(inputs, "input_index", "input_name", "input_display_name", AUDIO_DEFAULT_INPUT_TOKEN, "Default OS Input", default_input)
+    sync_selection(outputs, "output_index", "output_name", "output_display_name", AUDIO_DEFAULT_OUTPUT_TOKEN, "Default OS Output", default_output)
 
     if not outputs:
         audio["status"] = "No audio output devices"
@@ -2189,14 +2202,19 @@ def apply_project_state(project_data):
         refresh_audio_devices_locked()
         output_name = audio_state.get("output_name", "")
         input_name = audio_state.get("input_name", "")
-        if output_name:
+        if output_name == AUDIO_DEFAULT_OUTPUT_TOKEN:
+            audio["output_name"] = AUDIO_DEFAULT_OUTPUT_TOKEN
+            audio_reopen = True
+        elif output_name:
             for index, device_info in enumerate(audio["outputs"]):
                 if device_info["name"] == output_name:
                     audio["output_index"] = index
                     audio["output_name"] = device_info["name"]
                     audio_reopen = True
                     break
-        if input_name:
+        if input_name == AUDIO_DEFAULT_INPUT_TOKEN:
+            audio["input_name"] = AUDIO_DEFAULT_INPUT_TOKEN
+        elif input_name:
             for index, device_info in enumerate(audio["inputs"]):
                 if device_info["name"] == input_name:
                     audio["input_index"] = index
@@ -2467,10 +2485,12 @@ def draw(stdscr):
                             if settings_cursor == 1 and audio["outputs"]:
                                 audio["output_index"] = (audio["output_index"] + delta) % len(audio["outputs"])
                                 audio["output_name"] = audio["outputs"][audio["output_index"]]["name"]
+                                audio["output_display_name"] = audio["output_name"]
                                 audio_reopen = True
                             elif settings_cursor == 2 and audio["inputs"]:
                                 audio["input_index"] = (audio["input_index"] + delta) % len(audio["inputs"])
                                 audio["input_name"] = audio["inputs"][audio["input_index"]]["name"]
+                                audio["input_display_name"] = audio["input_name"]
                                 audio["status"] = short_label(f"Input selected: {audio['input_name']}", 42)
                             elif settings_cursor == 3:
                                 refresh_audio_devices_locked()
@@ -2778,8 +2798,8 @@ def draw(stdscr):
                 scope_show_drums=ui_state["scope_show_drums"]
 
             with audio_lock:
-                audio_output_name = audio["output_name"]
-                audio_input_name = audio["input_name"]
+                audio_output_name = audio["output_display_name"]
+                audio_input_name = audio["input_display_name"]
                 audio_output_count = len(audio["outputs"])
                 audio_input_count = len(audio["inputs"])
                 audio_status = audio["status"]
