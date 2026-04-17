@@ -78,7 +78,7 @@ CAMERA_REACTIVE_STYLES = [
     "CHROMA SPLIT",
     "MATRIX BEAT",
 ]
-SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "SOUND DEVICE", "PROJECT", "MIDI DEVICE", "MIDI NOTE", "MIDI MAP"]
+SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "PROJECT", "SOUND DEVICE", "MIDI DEVICE", "MIDI NOTE", "MIDI MAP"]
 MIDI_PAD_TARGETS = [
     ("pad_kick", "Pad Kick", "note"),
     ("pad_snare", "Pad Snare", "note"),
@@ -2329,15 +2329,6 @@ def draw(stdscr):
                         pass
                     elif settings_page == 2:
                         audio_reopen = False
-                        with audio_lock:
-                            if settings_cursor == 3:
-                                refresh_audio_devices_locked()
-                                audio_reopen = True
-                        if audio_reopen:
-                            close_audio_stream(stream)
-                            stream = open_audio_stream()
-                    elif settings_page == 3:
-                        audio_reopen = False
                         midi_reopen = False
                         try:
                             with project_lock:
@@ -2356,6 +2347,15 @@ def draw(stdscr):
                             stream = open_audio_stream()
                         if midi_reopen:
                             reopen_midi_input()
+                    elif settings_page == 3:
+                        audio_reopen = False
+                        with audio_lock:
+                            if settings_cursor == 3:
+                                refresh_audio_devices_locked()
+                                audio_reopen = True
+                        if audio_reopen:
+                            close_audio_stream(stream)
+                            stream = open_audio_stream()
                     elif settings_page == 4:
                         if settings_cursor == 1:
                             with midi_lock:
@@ -2442,23 +2442,6 @@ def draw(stdscr):
                             elif settings_cursor == 2:
                                 ui_state["camera_reactivity"] = clamp(ui_state["camera_reactivity"] + delta * 0.05, 0.0, 1.0)
                     elif settings_page == 2:
-                        audio_reopen = False
-                        with audio_lock:
-                            if settings_cursor == 1 and audio["outputs"]:
-                                audio["output_index"] = (audio["output_index"] + delta) % len(audio["outputs"])
-                                audio["output_name"] = audio["outputs"][audio["output_index"]]["name"]
-                                audio_reopen = True
-                            elif settings_cursor == 2 and audio["inputs"]:
-                                audio["input_index"] = (audio["input_index"] + delta) % len(audio["inputs"])
-                                audio["input_name"] = audio["inputs"][audio["input_index"]]["name"]
-                                audio["status"] = short_label(f"Input selected: {audio['input_name']}", 42)
-                            elif settings_cursor == 3:
-                                refresh_audio_devices_locked()
-                                audio_reopen = True
-                        if audio_reopen:
-                            close_audio_stream(stream)
-                            stream = open_audio_stream()
-                    elif settings_page == 3:
                         with project_lock:
                             refresh_project_files_locked()
                             if settings_cursor == 1:
@@ -2479,6 +2462,23 @@ def draw(stdscr):
                                 existing_names = project["files"][:]
                                 project["target_name"] = next_project_filename(existing_names)
                                 project["status"] = f"Next save slot: {project['target_name']}"
+                    elif settings_page == 3:
+                        audio_reopen = False
+                        with audio_lock:
+                            if settings_cursor == 1 and audio["outputs"]:
+                                audio["output_index"] = (audio["output_index"] + delta) % len(audio["outputs"])
+                                audio["output_name"] = audio["outputs"][audio["output_index"]]["name"]
+                                audio_reopen = True
+                            elif settings_cursor == 2 and audio["inputs"]:
+                                audio["input_index"] = (audio["input_index"] + delta) % len(audio["inputs"])
+                                audio["input_name"] = audio["inputs"][audio["input_index"]]["name"]
+                                audio["status"] = short_label(f"Input selected: {audio['input_name']}", 42)
+                            elif settings_cursor == 3:
+                                refresh_audio_devices_locked()
+                                audio_reopen = True
+                        if audio_reopen:
+                            close_audio_stream(stream)
+                            stream = open_audio_stream()
                     elif settings_page == 4:
                         midi_reopen = False
                         clear_notes = False
@@ -3094,21 +3094,21 @@ def draw(stdscr):
                     ])
                 elif settings_page == 2:
                     rows.extend([
-                        f"Output dev   {short_label(audio_output_name or 'Default', 42)}",
-                        f"Input dev    {short_label(audio_input_name or 'None', 42)}",
-                        f"Refresh      {audio_output_count:2d} out / {audio_input_count:2d} in",
-                        f"Audio in     Reserved for future input features",
-                        f"Audio stat   {short_label(audio_status, 42)}",
-                        f"How to use   Select output now, input is stored only",
-                    ])
-                elif settings_page == 3:
-                    rows.extend([
                         f"Project file {short_label(project_target_name or next_project_filename([]), 42)}",
                         f"Refresh      {project_file_count:2d} projects",
                         f"Save project Write current setup to selected file",
                         f"Load project Restore selected project file",
                         f"New slot     ←→ picks next numbered save slot",
                         f"Status       {short_label(project_status, 42)}",
+                    ])
+                elif settings_page == 3:
+                    rows.extend([
+                        f"Output dev   {short_label(audio_output_name or 'Default', 42)}",
+                        f"Input dev    {short_label(audio_input_name or 'None', 42)}",
+                        f"Refresh      {audio_output_count:2d} out / {audio_input_count:2d} in",
+                        f"Audio in     Reserved for future input features",
+                        f"Audio stat   {short_label(audio_status, 42)}",
+                        f"How to use   Select output now, input is stored only",
                     ])
                 elif settings_page == 4:
                     rows.extend([
