@@ -28,7 +28,7 @@ It runs as a single shell script that writes an embedded Python app to your home
 ## Files and folders
 
 - `mu.sh` — launcher and embedded app source of truth
-- `wav/` — saved mix recordings such as `untiteled.wav`
+- `wav/` — saved mix recordings such as `mush.wav`
 - `projects/` — saved project files using the `.mush` extension
 - `README.md` — project overview and usage notes
 

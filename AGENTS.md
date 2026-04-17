@@ -34,7 +34,7 @@ Recent work completed in `mu.sh`:
 - added loop overdub undo for stepping back the last recorded layer
 - added global mix recording that writes `.wav` files when stopped
 - fixed the 32-step sequencer timing so 32 steps run at 16th-note spacing instead of doubled-speed 32nd-note spacing
-- changed global mix recording to write numbered `untiteled*.wav` files in the launch directory without overwriting older takes
+- changed global mix recording to write numbered `mush*.wav` files without overwriting older takes
 - added extra synth FX controls for warmth, air, and reverb in the settings panel
 - added paged settings support for MIDI input device selection, per-note remapping, and MIDI learn for pad/knob bindings
 - added an alternate camera visual mode that live-streams webcam frames via `ffmpeg` inside the synth view when selected in settings
