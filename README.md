@@ -1,6 +1,6 @@
 # mush
 
-`mush` is a terminal synthesizer and drum machine launched by `synth.sh`.
+`mush` is a terminal synthesizer and drum machine launched by `mu.sh`.
 
 It runs as a single shell script that writes an embedded Python app to your home directory, creates a local virtualenv on first run, installs the required Python packages, and starts an interactive curses-based instrument.
 
@@ -18,7 +18,7 @@ It runs as a single shell script that writes an embedded Python app to your home
 
 ## Files and folders
 
-- `synth.sh` — launcher and embedded app source of truth
+- `mu.sh` — launcher and embedded app source of truth
 - `wav/` — saved mix recordings such as `untiteled.wav`
 - `projects/` — saved project files using the `.mush` extension
 - `README.md` — project overview and usage notes
@@ -28,7 +28,7 @@ Generated files in `wav/` and `projects/` are gitignored by default, except for 
 ## Running
 
 ```bash
-./synth.sh
+./mu.sh
 ```
 
 On first launch, the script creates:
@@ -115,13 +115,13 @@ They do not currently store recorded loop audio.
 
 ## Validation
 
-When editing `synth.sh`, useful checks are:
+When editing `mu.sh`, useful checks are:
 
 ```bash
-bash -n synth.sh
+bash -n mu.sh
 python3 - <<'PY'
 from pathlib import Path
-text = Path('synth.sh').read_text()
+text = Path('mu.sh').read_text()
 start = text.index("<< 'PYEOF'\n") + len("<< 'PYEOF'\n")
 end = text.index("\nPYEOF", start)
 compile(text[start:end], 'embedded_app.py', 'exec')
@@ -133,4 +133,4 @@ PY
 
 - audio input selection is saved for future expansion, but the current app does not process live input yet
 - the looper is free-running and not tempo-quantized
-- the whole app currently lives inside the `synth.sh` heredoc for convenience
+- the whole app currently lives inside the `mu.sh` heredoc for convenience

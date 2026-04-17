@@ -2,9 +2,9 @@
 
 ## Project
 
-This repository currently contains a single executable script: `synth.sh`.
+This repository currently contains a single executable script: `mu.sh`.
 
-`synth.sh` bootstraps and runs a terminal-based synthesizer called **mush**. The shell script writes an embedded Python program to `$HOME/.mush.py`, ensures a virtualenv exists at `$HOME/.mush-venv`, installs `numpy` and `sounddevice` on first run, and then starts the interactive app.
+`mu.sh` bootstraps and runs a terminal-based synthesizer called **mush**. The shell script writes an embedded Python program to `$HOME/.mush.py`, ensures a virtualenv exists at `$HOME/.mush-venv`, installs `numpy` and `sounddevice` on first run, and then starts the interactive app.
 
 The Python app provides:
 
@@ -18,7 +18,7 @@ The Python app provides:
 
 ## Current Progress
 
-Recent work completed in `synth.sh`:
+Recent work completed in `mu.sh`:
 
 - reduced audible clicks by smoothing pitch and output transitions in the synth engine
 - replaced hard clipping in main audio paths with soft limiting for smoother output
@@ -60,11 +60,11 @@ Recent work completed in `synth.sh`:
 ## Development Notes
 
 - Keep changes focused and minimal; this is a single-file project at the moment.
-- The Python source of truth is embedded inside `synth.sh`; do not edit `$HOME/.mush.py` directly.
+- The Python source of truth is embedded inside `mu.sh`; do not edit `$HOME/.mush.py` directly.
 - Prefer preserving the current structure unless there is a strong reason to split the embedded Python into separate files.
 - If audio behavior changes, favor fixes at the DSP/state-transition level rather than masking issues in the UI.
 - Be careful with anything that can introduce discontinuities between audio blocks; clicks usually come from abrupt state jumps, clipping, xruns, or loop boundary discontinuities.
-- Validate shell syntax with `bash -n synth.sh` after edits.
+- Validate shell syntax with `bash -n mu.sh` after edits.
 - Validate embedded Python syntax by extracting the heredoc or otherwise checking that the generated Python compiles.
 - Avoid adding network-dependent setup changes unless explicitly needed.
 - MIDI support may require Python MIDI dependencies; keep any bootstrap install changes minimal and focused.
@@ -88,11 +88,11 @@ Recent work completed in `synth.sh`:
 - compressor/limiter or master output headroom controls
 - presets and pattern storage
 - export captured loops to `.wav`
-- optional refactor: move embedded Python into tracked source files while keeping `synth.sh` as launcher
+- optional refactor: move embedded Python into tracked source files while keeping `mu.sh` as launcher
 
 ## Notes For Future Agents
 
-- If you touch `synth.sh`, remember that the visible shell file contains the real application logic inside the heredoc.
+- If you touch `mu.sh`, remember that the visible shell file contains the real application logic inside the heredoc.
 - When documenting controls, update both the on-screen help and this file if the controls materially change.
 - Do not assume the environment has audio output available during automated validation.
 - Interactive runtime testing should be described clearly to the user when full audio verification is not possible in the sandbox.
