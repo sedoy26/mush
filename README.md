@@ -13,6 +13,23 @@
 
 It runs as a single shell script that writes an embedded Python app to your home directory, creates a local virtualenv on first run, installs the required Python packages, and starts an interactive curses-based instrument.
 
+`projects/demo.mush` is checked in with portable default-audio settings so a fresh clone uses each user's own OS default output on first load instead of a machine-specific device name.
+
+## Status
+
+- primary support target: macOS terminal environments
+- likely portable to Linux with working PortAudio and terminal support
+- Windows support is unverified
+- audio input selection is stored for future use, but live input is not yet processed by the synth engine
+
+## Requirements
+
+- `python3`
+- a working terminal with `curses` support
+- PortAudio-compatible audio output for `sounddevice`
+- `ffmpeg` if you want to use camera visuals
+- optional MIDI dependencies handled by the bootstrap script
+
 ## Features
 
 - dual-oscillator synth with waveform, level, octave, and detune control
@@ -46,6 +63,18 @@ On first launch, the script creates:
 - `$HOME/.mush.py` for the generated runtime script
 
 The app expects a working terminal and an available audio output device. Camera mode also expects `ffmpeg` with camera capture support.
+
+## First launch
+
+On a first run after cloning:
+
+- start with `./mu.sh`
+- press `H` to toggle the help overlay
+- press `TAB` to switch between synth and drum focus
+- press `S` to open settings
+- load `projects/demo.mush` from the `PROJECT` settings tab if you want a ready-made example
+
+If you load the demo project on another machine, `mush` uses that machine's current default OS audio output by default.
 
 ## Main controls
 
@@ -104,8 +133,8 @@ The settings UI currently includes:
 
 - `MAIN` — synth, visuals, drum bank, oscillator, and FX settings
 - `CAM FX` — camera visual style and reactivity
-- `SOUND DEVICE` — audio output selection and stored input preference
 - `PROJECT` — save/load `.mush` project files
+- `SOUND DEVICE` — audio output selection and stored input preference
 - `MIDI DEVICE` — MIDI input selection and routing
 - `MIDI NOTE` — note remapping
 - `MIDI MAP` — learnable pad/knob bindings
@@ -117,10 +146,35 @@ Project files store the current working setup, including:
 - synth parameters and oscillator settings
 - drum pattern, BPM, bank, and per-voice levels
 - UI visual settings
-- selected audio input/output names
+- selected audio input/output names or the portable OS-default audio tokens
 - MIDI device settings, remaps, and bindings
 
 They do not currently store recorded loop audio.
+
+## Repository layout
+
+- `mu.sh` contains the launcher and the embedded Python application
+- `wav/` holds exported mix recordings; only `wav/demo.wav` is tracked
+- `projects/` holds saved `.mush` projects; only `projects/demo.mush` is tracked
+- community and repository health files live in `.github/`, `CONTRIBUTING.md`, `SECURITY.md`, and `LICENSE`
+
+## Known limitations
+
+- the looper is intentionally simple and not tempo-quantized
+- current playback is effectively one note lane with layered oscillators, not a full multitimbral performance engine
+- audio device hot-swapping is basic and intended for local use rather than pro-audio routing edge cases
+- camera mode depends on local `ffmpeg` support and device permissions
+- the app is still maintained as an embedded-Python single-file launcher for convenience
+
+## Contributing
+
+Contributions are welcome. Please read `CONTRIBUTING.md` before opening a pull request.
+
+For security-sensitive issues, use `SECURITY.md` rather than filing a public issue.
+
+## License
+
+This project is released under the MIT License. See `LICENSE`.
 
 ## Validation
 

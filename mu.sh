@@ -2150,12 +2150,36 @@ def capture_project_state():
         "midi": midi_state,
     }
 
+def normalize_project_data(project_data):
+    if not isinstance(project_data, dict):
+        raise ValueError("Project file is not a JSON object")
+    normalized = dict(project_data)
+    file_format = normalized.get("format")
+    if file_format not in (None, "mush-project"):
+        raise ValueError(f"Unsupported project format: {file_format}")
+    normalized.setdefault("format", "mush-project")
+    normalized.setdefault("version", 1)
+    if int(normalized.get("version", 1)) > 1:
+        raise ValueError(f"Unsupported project version: {normalized['version']}")
+    audio_state = normalized.setdefault("audio", {})
+    if not audio_state.get("output_name"):
+        audio_state["output_name"] = AUDIO_DEFAULT_OUTPUT_TOKEN
+    if not audio_state.get("input_name"):
+        audio_state["input_name"] = AUDIO_DEFAULT_INPUT_TOKEN
+    normalized.setdefault("synth", {})
+    normalized.setdefault("drums", {})
+    normalized.setdefault("ui", {})
+    normalized.setdefault("midi", {})
+    return normalized
+
 def apply_project_state(project_data):
+    project_data = normalize_project_data(project_data)
     synth_state = project_data.get("synth", {})
     drum_state = project_data.get("drums", {})
     ui_snapshot = project_data.get("ui", {})
     audio_state = project_data.get("audio", {})
     midi_state = project_data.get("midi", {})
+    load_notes = []
 
     with synth_lock:
         for key in (
@@ -2206,20 +2230,32 @@ def apply_project_state(project_data):
             audio["output_name"] = AUDIO_DEFAULT_OUTPUT_TOKEN
             audio_reopen = True
         elif output_name:
+            matched_output = False
             for index, device_info in enumerate(audio["outputs"]):
                 if device_info["name"] == output_name:
                     audio["output_index"] = index
                     audio["output_name"] = device_info["name"]
                     audio_reopen = True
+                    matched_output = True
                     break
+            if not matched_output:
+                audio["output_name"] = AUDIO_DEFAULT_OUTPUT_TOKEN
+                audio_reopen = True
+                load_notes.append("audio output fell back to OS default")
         if input_name == AUDIO_DEFAULT_INPUT_TOKEN:
             audio["input_name"] = AUDIO_DEFAULT_INPUT_TOKEN
         elif input_name:
+            matched_input = False
             for index, device_info in enumerate(audio["inputs"]):
                 if device_info["name"] == input_name:
                     audio["input_index"] = index
                     audio["input_name"] = device_info["name"]
+                    matched_input = True
                     break
+            if not matched_input:
+                audio["input_name"] = AUDIO_DEFAULT_INPUT_TOKEN
+                load_notes.append("audio input fell back to OS default")
+        refresh_audio_devices_locked()
 
     with midi_lock:
         refresh_midi_devices_locked()
@@ -2235,7 +2271,7 @@ def apply_project_state(project_data):
                         midi[binding_key][target_id] = None if value is None else int(value)
         midi["learn_mode"] = "off"
 
-    return audio_reopen
+    return audio_reopen, load_notes
 
 def save_project_locked():
     refresh_project_files_locked()
@@ -2255,8 +2291,11 @@ def load_project_locked():
         raise FileNotFoundError(f"Project not found: {os.path.basename(path)}")
     with open(path, "r", encoding="utf-8") as project_file:
         project_data = json.load(project_file)
-    audio_reopen = apply_project_state(project_data)
-    project["status"] = f"Loaded {os.path.basename(path)}"
+    audio_reopen, load_notes = apply_project_state(project_data)
+    status = f"Loaded {os.path.basename(path)}"
+    if load_notes:
+        status = f"{status} ({'; '.join(load_notes)})"
+    project["status"] = short_label(status, 42)
     project["target_name"] = os.path.basename(path)
     refresh_project_files_locked()
     return path, audio_reopen
