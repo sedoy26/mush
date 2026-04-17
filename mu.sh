@@ -3045,15 +3045,25 @@ def draw(stdscr):
 
             if settings_open:
                 box_w = min(68, max(38, w - 8))
-                box_h = 19 if settings_page == 0 else (15 if settings_page in (1, 2, 3) else 14)
+                base_box_h = 19 if settings_page == 0 else (15 if settings_page in (1, 2, 3) else 14)
+                tab_rows = [[]]
+                tab_x = 2
+                for page_idx, page_name in enumerate(SETTINGS_PAGE_NAMES):
+                    tab_text = f" {page_name} "
+                    tab_w = len(tab_text)
+                    if tab_x > 2 and tab_x + tab_w > box_w - 2:
+                        tab_rows.append([])
+                        tab_x = 2
+                    tab_rows[-1].append((page_idx, tab_x, tab_text))
+                    tab_x += tab_w + 1
+                box_h = base_box_h + len(tab_rows) - 1
                 box_x = max(2, (w - box_w) // 2)
                 box_y = max(2, (h - box_h) // 2)
                 draw_box(stdscr, box_y, box_x, box_w, box_h, f"SETTINGS {SETTINGS_PAGE_NAMES[settings_page]}", scope_attr|B)
-                tab_x = box_x + 2
-                for page_idx, page_name in enumerate(SETTINGS_PAGE_NAMES):
-                    tab_attr = (C[8]|B) if page_idx == settings_page else C[3]
-                    safe_addstr(stdscr, box_y + 1, tab_x, f" {page_name} ", tab_attr)
-                    tab_x += len(page_name) + 3
+                for row_idx, row_tabs in enumerate(tab_rows):
+                    for page_idx, tab_x, tab_text in row_tabs:
+                        tab_attr = (C[8]|B) if page_idx == settings_page else C[3]
+                        safe_addstr(stdscr, box_y + 1 + row_idx, box_x + tab_x, tab_text, tab_attr)
                 channel_lbl = "ALL" if midi_channel < 0 else f"CH {midi_channel + 1}"
                 current_map_lbl = midi_to_name(midi_note_map_current) if midi_note_map_current is not None else "--"
                 rows = [f"Section      {SETTINGS_PAGE_NAMES[settings_page]}"]
@@ -3130,9 +3140,10 @@ def draw(stdscr):
                         f"How to bind  Select target, arm Learn, move knob/hit pad",
                         f"Last MIDI    {short_label(midi_last_message or '--', 42)}",
                     ])
+                rows_y = box_y + 2 + len(tab_rows)
                 for idx, row_text in enumerate(rows):
                     attr = (C[8]|B) if idx == settings_cursor else C[3]
-                    safe_addstr(stdscr, box_y + 3 + idx, box_x + 2, row_text.ljust(box_w-4), attr)
+                    safe_addstr(stdscr, rows_y + idx, box_x + 2, row_text.ljust(box_w-4), attr)
                 footer = "Row 1 switches page. ↑↓ select, ←→ change, Enter/Space run learn/save/clear."
                 safe_addstr(stdscr, box_y + box_h - 2, box_x + 2, footer[:box_w-4], C[6])
 
