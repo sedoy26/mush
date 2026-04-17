@@ -9,11 +9,9 @@
 ╚═╝     ╚═╝ ╚═════╝ ╚═╝╚══════╝╚═╝  ╚═╝
 ```
 
-`mush` is a terminal synthesizer and drum machine launched by `mu.sh`.
+`mush` is a terminal synthesizer, drum machine, looper, and MIDI playground for the command line.
 
-It runs as a single shell script that writes an embedded Python app to your home directory, creates a local virtualenv on first run, installs the required Python packages, and starts an interactive curses-based instrument.
-
-`projects/demo.mush` is checked in with portable default-audio settings so a fresh clone uses each user's own OS default output on first load instead of a machine-specific device name.
+It combines playable synth voices, a step sequencer, live effects, recording tools, and terminal visuals in a fast keyboard-driven interface.
 
 ## Quick Start
 
