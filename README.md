@@ -15,6 +15,12 @@ It runs as a single shell script that writes an embedded Python app to your home
 
 `projects/demo.mush` is checked in with portable default-audio settings so a fresh clone uses each user's own OS default output on first load instead of a machine-specific device name.
 
+## Quick Start
+
+```bash
+git clone git@github.com:sedoy26/mush.git && cd mush && chmod +x mu.sh && ./mu.sh
+```
+
 ## Status
 
 - primary support target: macOS terminal environments
