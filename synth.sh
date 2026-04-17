@@ -49,6 +49,8 @@ CAMERA_OUTPUT_FPS = 12
 CAMERA_FRAME_WIDTH = 160
 CAMERA_FRAME_HEIGHT = 90
 CAMERA_DEVICE = os.environ.get("MURSYNTH_CAMERA_DEVICE", "0")
+INPUT_POLL_MS = 16
+ESC_KEY_DELAY_MS = 25
 
 KEYBOARD_OFFSETS = {
     ord('a'):0,  ord('w'):1,  ord('s'):2,  ord('e'):3,
@@ -73,7 +75,7 @@ CAMERA_REACTIVE_STYLES = [
     "CHROMA SPLIT",
     "MATRIX BEAT",
 ]
-SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "MIDI DEV", "MIDI NOTE", "MIDI MAP"]
+SETTINGS_PAGE_NAMES = ["MAIN", "CAM FX", "MIDI DEVICE", "MIDI NOTE", "MIDI MAP"]
 MIDI_PAD_TARGETS = [
     ("pad_kick", "Pad Kick", "note"),
     ("pad_snare", "Pad Snare", "note"),
@@ -1858,7 +1860,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
             (["G"], "Start or stop global mix recording to a WAV file."),
             (["TAB"], "Switch between synth focus and drum sequencer focus."),
             (["←", "→", "↑", "↓"], "Move around the drum grid while sequencer focus is active."),
-            (["SPC", "r", "c", "C", "1", "2"], "Toggle step, run, clear row/all with double-press confirm, or load a 32-step pattern."),
+            (["SPC", "r", "c", "X", "1", "2"], "Toggle step, run, clear row/all with double-press confirm, or load a 32-step pattern."),
             (["S"], "Open settings for synth, camera FX, MIDI device selection, note remaps, and pad/knob learn."),
         ]),
     ]
@@ -1909,7 +1911,11 @@ def selected_midi_binding_locked():
 #  MAIN DRAW LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 def draw(stdscr):
-    curses.curs_set(0); stdscr.nodelay(True); stdscr.keypad(True)
+    curses.curs_set(0); stdscr.timeout(INPUT_POLL_MS); stdscr.keypad(True)
+    try:
+        curses.set_escdelay(ESC_KEY_DELAY_MS)
+    except AttributeError:
+        pass
     curses.start_color(); curses.use_default_colors()
     curses.init_pair(1,  curses.COLOR_BLACK,   curses.COLOR_CYAN)    # header
     curses.init_pair(2,  curses.COLOR_CYAN,    -1)                   # label
@@ -2282,7 +2288,7 @@ def draw(stdscr):
                             drum_clear_confirm = ("row", seq_cursor_v)
                             drum_notice = f"Press c again to clear {DRUM_NAMES[seq_cursor_v].strip()} row"
                             drum_notice_until = now + 1.2
-                    elif ch == ord('C'):
+                    elif ch == ord('X'):
                         if drum_clear_confirm == ("all", None) and now < drum_notice_until:
                             with drum_lock:
                                 drum["steps"] = [[False]*NUM_STEPS for _ in range(NUM_DRUM_VOICES)]
@@ -2291,7 +2297,7 @@ def draw(stdscr):
                             drum_clear_confirm = None
                         else:
                             drum_clear_confirm = ("all", None)
-                            drum_notice = "Press Shift+C again to clear all drum steps"
+                            drum_notice = "Press Shift+X again to clear all drum steps"
                             drum_notice_until = now + 1.2
                     elif ch == ord(','):
                         drum_clear_confirm = None
@@ -2502,7 +2508,9 @@ def draw(stdscr):
             safe_addstr(stdscr,26,24,"TIME",C[2]); safe_addstr(stdscr,26,29,f"{delay_ms:3d}ms",C[3]); safe_addstr(stdscr,26,36,"V/B",C[6])
             safe_addstr(stdscr,27,4,"DLY ",C[2]); safe_addstr(stdscr,27,9,hbar(fx_mix,8),C[5]); safe_addstr(stdscr,27,18,"J/K",C[6])
             safe_addstr(stdscr,27,24,"FBK ",C[2]); safe_addstr(stdscr,27,29,hbar(fx_feedback,6),C[5]); safe_addstr(stdscr,27,36,"N/M",C[6])
-            safe_addstr(stdscr,28,4,f"WRM {int(fx_warmth*100):3d}% AIR {int(fx_air*100):3d}% RVB {int(fx_reverb*100):3d}%",C[6])
+            safe_addstr(stdscr,28,4,"WRM ",C[2]); safe_addstr(stdscr,28,8,hbar(fx_warmth,4),C[5])
+            safe_addstr(stdscr,28,16,"AIR ",C[2]); safe_addstr(stdscr,28,20,hbar(fx_air,4),C[5])
+            safe_addstr(stdscr,28,28,"RVB ",C[2]); safe_addstr(stdscr,28,32,hbar(fx_reverb,4),C[5])
 
             # ── KEYS ───────────────────────────────
             safe_addstr(stdscr,29,2,"KEYS",C[2])
@@ -2618,7 +2626,7 @@ def draw(stdscr):
 
             if settings_open:
                 box_w = min(68, max(38, w - 8))
-                box_h = 18 if settings_page == 0 else (15 if settings_page == 1 else 14)
+                box_h = 19 if settings_page == 0 else (15 if settings_page == 1 else 14)
                 box_x = max(2, (w - box_w) // 2)
                 box_y = max(2, (h - box_h) // 2)
                 draw_box(stdscr, box_y, box_x, box_w, box_h, f"SETTINGS {SETTINGS_PAGE_NAMES[settings_page]}", scope_attr|B)
