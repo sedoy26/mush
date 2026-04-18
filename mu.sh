@@ -110,6 +110,24 @@ MIDI_BIND_TARGETS = MIDI_PAD_TARGETS + MIDI_CC_TARGETS
 MIDI_BIND_LABELS = {target_id: label for target_id, label, _ in MIDI_BIND_TARGETS}
 MIDI_BIND_KINDS = {target_id: kind for target_id, _, kind in MIDI_BIND_TARGETS}
 
+def default_oscillators():
+    return [
+        {
+            "waveform": 0,
+            "level": 0.75,
+            "octave": 0,
+            "detune_cents": 0.0,
+            "voice_phases": [0.0] * MAX_VOICES,
+        },
+        {
+            "waveform": 1,
+            "level": 0.0,
+            "octave": -1,
+            "detune_cents": -3.0,
+            "voice_phases": [0.0] * MAX_VOICES,
+        },
+    ]
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SYNTH STATE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -123,22 +141,7 @@ synth = {
     "lfo_depth_current": 0.0,
     "lfo_target": 0, "lfo_phase": 0.0,
     "filter_on": False, "cutoff": 0.8, "resonance": 0.0,
-    "oscillators": [
-        {
-            "waveform": 0,
-            "level": 0.75,
-            "octave": 0,
-            "detune_cents": 0.0,
-            "voice_phases": [0.0] * MAX_VOICES,
-        },
-        {
-            "waveform": 1,
-            "level": 0.45,
-            "octave": -1,
-            "detune_cents": -3.0,
-            "voice_phases": [0.0] * MAX_VOICES,
-        },
-    ],
+    "oscillators": default_oscillators(),
     "active_osc": 0,
     "voices": 1,
     "freq_current": 261.63,
@@ -1131,7 +1134,7 @@ def process_loop(live_signal):
 
 def gen_synth(frames):
     with synth_lock:
-        target_freq = current_play_freq_locked(); vol_target = synth["volume"]
+        play_freq  = current_play_freq_locked(); vol_target = synth["volume"]
         env       = synth["env"];   note   = note_active_locked()
         gate      = synth["gate_mode"]
         atk       = max(synth["attack"],  0.001)
@@ -1159,6 +1162,7 @@ def gen_synth(frames):
         last_out  = synth["last_output"]
 
     gate_open = (gate==1) or note
+    target_freq = play_freq if gate_open or freq_cur <= 0.0 else freq_cur
     out = np.zeros(frames, dtype=np.float32)
 
     if not gate_open and env < 0.0001:
@@ -2206,6 +2210,11 @@ def apply_project_state(project_data):
             if key in synth_state:
                 synth[key] = synth_state[key]
         loaded_oscillators = synth_state.get("oscillators", [])
+        default_osc_state = default_oscillators()
+        if isinstance(loaded_oscillators, list) and loaded_oscillators:
+            for osc_idx, osc in enumerate(default_osc_state[:len(synth["oscillators"])]):
+                for key in ("waveform", "level", "octave", "detune_cents"):
+                    synth["oscillators"][osc_idx][key] = osc[key]
         for osc_idx, osc_state in enumerate(loaded_oscillators[:len(synth["oscillators"])]):
             for key in ("waveform", "level", "octave", "detune_cents"):
                 if key in osc_state:
@@ -2346,7 +2355,9 @@ def draw(stdscr):
     last_note    = midi_to_name(60)
     held_note    = None      # tracks which note key is "down"
     last_note_t  = 0.0
-    NOTE_TIMEOUT = 0.22      # release after 220ms with no key repeat
+    NOTE_TIMEOUT = 0.18      # release shortly after key repeat stops
+    NOTE_INITIAL_GRACE = 0.55  # allow for OS key-repeat startup delay
+    held_note_repeat_seen = False
     help_open    = False
     seq_cursor_v = 0
     seq_cursor_s = 0
@@ -2407,12 +2418,14 @@ def draw(stdscr):
                 drum_clear_confirm = None
 
             # auto-release: curses has no keyup, so we release after timeout
-            if held_note is not None and (now - last_note_t) > NOTE_TIMEOUT:
+            hold_timeout = NOTE_TIMEOUT if held_note_repeat_seen else NOTE_INITIAL_GRACE
+            if held_note is not None and (now - last_note_t) > hold_timeout:
                 with synth_lock:
                     synth["key_note_on"] = False
                     synth["key_offset"] = None
                     sync_pitch_locked()
                 held_note = None
+                held_note_repeat_seen = False
 
             if settings_open:
                 if project_dialog is not None:
@@ -2675,10 +2688,15 @@ def draw(stdscr):
                         synth["key_offset"] = None
                         sync_pitch_locked()
                     held_note = None
+                    held_note_repeat_seen = False
                 elif ch == ord('S'):
                     settings_open = True
                 elif focus == "synth":
                     if ch in KEYBOARD_OFFSETS:
+                        if held_note == ch:
+                            held_note_repeat_seen = True
+                        else:
+                            held_note_repeat_seen = False
                         with synth_lock:
                             synth["key_offset"] = KEYBOARD_OFFSETS[ch]
                             synth["key_note_on"] = True
@@ -2693,6 +2711,7 @@ def draw(stdscr):
                             synth["key_offset"] = None
                             sync_pitch_locked()
                         held_note = None
+                        held_note_repeat_seen = False
                     elif ch == ord('q'):
                         break
                     elif ch == ord('1'):
