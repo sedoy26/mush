@@ -2958,17 +2958,17 @@ def draw(stdscr):
             # ── LFO ────────────────────────────────
             safe_addstr(stdscr,16,2,"─ LFO ─────────────────────",C[2])
             safe_addstr(stdscr,17,4,"WAVE",C[2])
-            x=10
+            x=9
             for i,nm in enumerate(LFO_WAVES):
-                safe_addstr(stdscr,17,x,f" {nm} ",(C[4]|B) if i==lfo_wf else C[3]); x+=6
-            safe_addstr(stdscr,17,x+1,"l",C[6])
-            safe_addstr(stdscr,17,25,"TRGT",C[2])
-            x=30
+                safe_addstr(stdscr,17,x,f"{nm} ",(C[4]|B) if i==lfo_wf else C[3]); x+=4
+            safe_addstr(stdscr,17,21,"l",C[6])
+            safe_addstr(stdscr,17,23,"TGT",C[2])
+            x=27
             for i,nm in enumerate(LFO_TARGETS):
-                safe_addstr(stdscr,17,x,f" {nm} ",(C[4]|B) if i==lfo_tgt else C[3]); x+=7
-            safe_addstr(stdscr,17,min(x+1, 37),"o",C[6])
+                safe_addstr(stdscr,17,x,f"{nm}",(C[4]|B) if i==lfo_tgt else C[3]); x+=4
+            safe_addstr(stdscr,17,39,"o",C[6])
             safe_addstr(stdscr,18,4,"RATE",C[2]); safe_addstr(stdscr,18,9,f"{lfo_rate:5.2f}Hz",C[3]); safe_addstr(stdscr,18,18,",/.",C[6])
-            safe_addstr(stdscr,18,24,"DEPT",C[2]); safe_addstr(stdscr,18,29,hbar(lfo_dep,8),C[5]); safe_addstr(stdscr,18,38,";/'",C[6])
+            safe_addstr(stdscr,18,24,"DEPT",C[2]); safe_addstr(stdscr,18,29,hbar(lfo_dep,8),C[5]); safe_addstr(stdscr,18,37,";/'",C[6])
             lx=int((lfo_ph%1.0)*12)
             safe_addstr(stdscr,19,9," "*lx+"◆"+" "*(11-lx),scope_attr)
 
@@ -2978,7 +2978,7 @@ def draw(stdscr):
             safe_addstr(stdscr,22,8," ON  " if filt_on else " OFF ",(C[9]|B) if filt_on else C[3])
             safe_addstr(stdscr,22,15,"p",C[6])
             cHz=int(20*(1000**cutoff))
-            safe_addstr(stdscr,22,19,"CUT",C[2]); safe_addstr(stdscr,22,23,hbar(cutoff,8),C[5] if filt_on else C[3]); safe_addstr(stdscr,22,32,f"{cHz:5d}",C[3]); safe_addstr(stdscr,22,38,"-/=",C[6])
+            safe_addstr(stdscr,22,19,"CUT",C[2]); safe_addstr(stdscr,22,23,hbar(cutoff,8),C[5] if filt_on else C[3]); safe_addstr(stdscr,22,32,f"{cHz:5d}",C[3]); safe_addstr(stdscr,22,37,"-/=",C[6])
             safe_addstr(stdscr,23,4,"RES ",C[2]); safe_addstr(stdscr,23,8,hbar(res,12),C[5] if filt_on else C[3]); safe_addstr(stdscr,23,21,f"{int(res*100):3d}%",C[3]); safe_addstr(stdscr,23,30,"_/+",C[6])
 
             # ── FX ─────────────────────────────────
