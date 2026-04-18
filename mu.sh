@@ -3227,20 +3227,92 @@ def draw(stdscr):
 curses.wrapper(draw)
 PYEOF
 
+run_pkg_install() {
+  if [ "$#" -eq 0 ]; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+install_system_prereqs() {
+  local missing_ffmpeg="$1"
+  local os_name
+  os_name="$(uname -s 2>/dev/null || echo unknown)"
+
+  case "$os_name" in
+    Darwin)
+      if command -v brew >/dev/null 2>&1; then
+        echo "Installing system prerequisites with Homebrew..."
+        brew install portaudio
+        if [ "$missing_ffmpeg" = "1" ]; then
+          brew install ffmpeg
+        fi
+      fi
+      ;;
+    Linux)
+      if command -v apt-get >/dev/null 2>&1; then
+        echo "Installing system prerequisites with apt..."
+        run_pkg_install apt-get update
+        if [ "$missing_ffmpeg" = "1" ]; then
+          run_pkg_install apt-get install -y ffmpeg libportaudio2 portaudio19-dev
+        else
+          run_pkg_install apt-get install -y libportaudio2 portaudio19-dev
+        fi
+      elif command -v dnf >/dev/null 2>&1; then
+        echo "Installing system prerequisites with dnf..."
+        if [ "$missing_ffmpeg" = "1" ]; then
+          run_pkg_install dnf install -y ffmpeg portaudio portaudio-devel
+        else
+          run_pkg_install dnf install -y portaudio portaudio-devel
+        fi
+      elif command -v pacman >/dev/null 2>&1; then
+        echo "Installing system prerequisites with pacman..."
+        if [ "$missing_ffmpeg" = "1" ]; then
+          run_pkg_install pacman -Sy --noconfirm ffmpeg portaudio
+        else
+          run_pkg_install pacman -Sy --noconfirm portaudio
+        fi
+      fi
+      ;;
+  esac
+}
+
 # ── bootstrap venv on first run ──────────
 if [ ! -f "$VENV_DIR/bin/python" ]; then
   echo "First run: setting up virtual environment..."
   python3 -m venv "$VENV_DIR"
 fi
 
+NEED_PYTHON_DEPS=0
 if ! "$VENV_DIR/bin/python" - <<'PY' >/dev/null 2>&1
 import numpy, sounddevice, mido, rtmidi
 PY
 then
+  NEED_PYTHON_DEPS=1
+fi
+
+NEED_FFMPEG=0
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  NEED_FFMPEG=1
+fi
+
+if [ "$NEED_PYTHON_DEPS" = "1" ] || [ "$NEED_FFMPEG" = "1" ]; then
+  install_system_prereqs "$NEED_FFMPEG"
+fi
+
+if [ "$NEED_PYTHON_DEPS" = "1" ]; then
   echo "Installing mush dependencies..."
   "$VENV_DIR/bin/pip" install --quiet numpy sounddevice mido python-rtmidi
   echo "Done! Starting synth..."
   sleep 1
+fi
+
+if [ "$NEED_FFMPEG" = "1" ] && ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Warning: ffmpeg is still unavailable, so camera mode will stay disabled until it is installed."
 fi
 
 exec "$VENV_DIR/bin/python" "$PY_SCRIPT"
