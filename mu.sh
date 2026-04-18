@@ -1924,7 +1924,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
         safe_addstr(scr, goal_y + i, left_x + 6, line, C[6])
 
 def settings_row_count(page):
-    return [14, 7, 7, 7, 9, 8, 7][page]
+    return [14, 7, 5, 7, 9, 8, 7][page]
 
 def selected_midi_bind_target_locked():
     return MIDI_BIND_TARGETS[midi["learn_target_index"]]
@@ -2054,6 +2054,20 @@ def next_project_filename(existing_names):
         if candidate not in existing_names:
             return candidate
         idx += 1
+
+def normalize_project_filename(name):
+    text = os.path.basename(str(name or "").strip())
+    if not text:
+        return ""
+    if not text.endswith(PROJECT_FILE_EXT):
+        text = f"{text}{PROJECT_FILE_EXT}"
+    return text
+
+def project_name_stem(name):
+    normalized = normalize_project_filename(name)
+    if normalized.endswith(PROJECT_FILE_EXT):
+        return normalized[:-len(PROJECT_FILE_EXT)]
+    return normalized
 
 def refresh_project_files_locked():
     project_dir = os.path.join(os.getcwd(), PROJECT_DIRNAME)
@@ -2340,6 +2354,7 @@ def draw(stdscr):
     settings_open = False
     settings_page = 0
     settings_cursor = 0
+    project_dialog = None
     drum_clear_confirm = None
     drum_notice = ""
     drum_notice_until = 0.0
@@ -2352,6 +2367,31 @@ def draw(stdscr):
 
     with midi_lock:
         refresh_midi_devices_locked()
+
+    def open_project_dialog(kind):
+        nonlocal project_dialog
+        with project_lock:
+            refresh_project_files_locked()
+            files = project["files"][:]
+            selected_index = int(clamp(project["selected_index"], 0, max(0, len(files) - 1))) if files else 0
+            current_name = project["target_name"] or (files[selected_index] if files else "")
+            if kind == "save" and not project["target_name"]:
+                current_name = next_project_filename(files)
+            elif kind == "open" and not current_name and files:
+                current_name = files[selected_index]
+            project_dialog = {
+                "kind": kind,
+                "files": files,
+                "selected_index": selected_index,
+                "file_name": normalize_project_filename(current_name) if kind == "open" else project_name_stem(current_name),
+                "message": "",
+                "replace_on_type": (kind == "save" and current_name == next_project_filename(files)),
+                "cursor_pos": len(project_name_stem(current_name)) if kind == "save" else 0,
+            }
+
+    def close_project_dialog():
+        nonlocal project_dialog
+        project_dialog = None
 
     try:
         while True:
@@ -2375,6 +2415,74 @@ def draw(stdscr):
                 held_note = None
 
             if settings_open:
+                if project_dialog is not None:
+                    if ch in (27,):
+                        close_project_dialog()
+                    elif ch == curses.KEY_UP:
+                        if project_dialog["files"]:
+                            project_dialog["selected_index"] = (project_dialog["selected_index"] - 1) % len(project_dialog["files"])
+                            selected_name = project_dialog["files"][project_dialog["selected_index"]]
+                            project_dialog["file_name"] = selected_name if project_dialog["kind"] == "open" else project_name_stem(selected_name)
+                            project_dialog["replace_on_type"] = False
+                            project_dialog["cursor_pos"] = len(project_dialog["file_name"])
+                    elif ch == curses.KEY_DOWN:
+                        if project_dialog["files"]:
+                            project_dialog["selected_index"] = (project_dialog["selected_index"] + 1) % len(project_dialog["files"])
+                            selected_name = project_dialog["files"][project_dialog["selected_index"]]
+                            project_dialog["file_name"] = selected_name if project_dialog["kind"] == "open" else project_name_stem(selected_name)
+                            project_dialog["replace_on_type"] = False
+                            project_dialog["cursor_pos"] = len(project_dialog["file_name"])
+                    elif ch == curses.KEY_LEFT and project_dialog["kind"] == "save":
+                        project_dialog["cursor_pos"] = max(0, project_dialog.get("cursor_pos", len(project_dialog["file_name"] or "")) - 1)
+                    elif ch == curses.KEY_RIGHT and project_dialog["kind"] == "save":
+                        project_dialog["cursor_pos"] = min(len(project_dialog["file_name"]), project_dialog.get("cursor_pos", len(project_dialog["file_name"] or "")) + 1)
+                    elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                        if project_dialog["kind"] == "save":
+                            cursor_pos = project_dialog.get("cursor_pos", len(project_dialog["file_name"] or ""))
+                            if cursor_pos > 0:
+                                project_dialog["file_name"] = project_dialog["file_name"][:cursor_pos-1] + project_dialog["file_name"][cursor_pos:]
+                                project_dialog["cursor_pos"] = cursor_pos - 1
+                            project_dialog["replace_on_type"] = False
+                    elif ch in (ord(' '), ord('\n'), 10, 13):
+                        try:
+                            audio_reopen = False
+                            midi_reopen = False
+                            with project_lock:
+                                refresh_project_files_locked()
+                                project["target_name"] = normalize_project_filename(project_dialog["file_name"])
+                                if project_dialog["kind"] == "open":
+                                    if not project["target_name"] and project_dialog["files"]:
+                                        project["target_name"] = project_dialog["files"][project_dialog["selected_index"]]
+                                    _, audio_reopen = load_project_locked()
+                                    midi_reopen = True
+                                elif project_dialog["kind"] == "save":
+                                    if not project["target_name"]:
+                                        raise ValueError("Project file name is empty")
+                                    save_project_locked()
+                            if audio_reopen:
+                                close_audio_stream(stream)
+                                stream = open_audio_stream()
+                            if midi_reopen:
+                                reopen_midi_input()
+                            close_project_dialog()
+                        except Exception as exc:
+                            project_dialog["message"] = short_label(str(exc), 42)
+                    elif project_dialog["kind"] == "save" and 32 <= ch <= 126:
+                        if chr(ch) not in ('/', '\\'):
+                            if project_dialog.get("replace_on_type"):
+                                project_dialog["file_name"] = chr(ch)
+                                project_dialog["cursor_pos"] = 1
+                            else:
+                                cursor_pos = project_dialog.get("cursor_pos", len(project_dialog["file_name"] or ""))
+                                current = project_dialog["file_name"]
+                                project_dialog["file_name"] = os.path.basename(current[:cursor_pos] + chr(ch) + current[cursor_pos:])
+                                project_dialog["cursor_pos"] = cursor_pos + 1
+                            project_dialog["replace_on_type"] = False
+                    elif ch == -1:
+                        pass
+                    if project_dialog is not None:
+                        ch = -1
+
                 row_count = settings_row_count(settings_page)
                 if ch == ord('q'):
                     break
@@ -2384,25 +2492,10 @@ def draw(stdscr):
                     if settings_page == 1:
                         pass
                     elif settings_page == 2:
-                        audio_reopen = False
-                        midi_reopen = False
-                        try:
-                            with project_lock:
-                                if settings_cursor == 2:
-                                    refresh_project_files_locked()
-                                elif settings_cursor == 3:
-                                    save_project_locked()
-                                elif settings_cursor == 4:
-                                    _, audio_reopen = load_project_locked()
-                                    midi_reopen = True
-                        except Exception as exc:
-                            with project_lock:
-                                project["status"] = short_label(str(exc), 42)
-                        if audio_reopen:
-                            close_audio_stream(stream)
-                            stream = open_audio_stream()
-                        if midi_reopen:
-                            reopen_midi_input()
+                        if settings_cursor == 1:
+                            open_project_dialog("open")
+                        elif settings_cursor == 2:
+                            open_project_dialog("save")
                     elif settings_page == 3:
                         audio_reopen = False
                         with audio_lock:
@@ -2498,26 +2591,7 @@ def draw(stdscr):
                             elif settings_cursor == 2:
                                 ui_state["camera_reactivity"] = clamp(ui_state["camera_reactivity"] + delta * 0.05, 0.0, 1.0)
                     elif settings_page == 2:
-                        with project_lock:
-                            refresh_project_files_locked()
-                            if settings_cursor == 1:
-                                project_names = project["files"][:]
-                                if project["target_name"] not in project_names:
-                                    project_names.append(project["target_name"])
-                                project_names = sorted(name for name in project_names if name)
-                                if project_names:
-                                    current_name = project["target_name"] or project_names[0]
-                                    current_index = project_names.index(current_name) if current_name in project_names else 0
-                                    next_index = (current_index + delta) % len(project_names)
-                                    project["target_name"] = project_names[next_index]
-                                    if project["target_name"] in project["files"]:
-                                        project["selected_index"] = project["files"].index(project["target_name"])
-                            elif settings_cursor == 2:
-                                refresh_project_files_locked()
-                            elif settings_cursor == 5:
-                                existing_names = project["files"][:]
-                                project["target_name"] = next_project_filename(existing_names)
-                                project["status"] = f"Next save slot: {project['target_name']}"
+                        pass
                     elif settings_page == 3:
                         audio_reopen = False
                         with audio_lock:
@@ -3154,11 +3228,9 @@ def draw(stdscr):
                     ])
                 elif settings_page == 2:
                     rows.extend([
-                        f"Project file {short_label(project_target_name or next_project_filename([]), 42)}",
-                        f"Refresh      {project_file_count:2d} projects",
-                        f"Save project Write current setup to selected file",
-                        f"Load project Restore selected project file",
-                        f"New slot     ←→ picks next numbered save slot",
+                        f"Open         Browse {project_file_count:2d} project files",
+                        f"Save         Save current setup as current or new file",
+                        f"Current file {short_label(project_target_name or next_project_filename([]), 42)}",
                         f"Status       {short_label(project_status, 42)}",
                     ])
                 elif settings_page == 3:
@@ -3206,6 +3278,55 @@ def draw(stdscr):
                     safe_addstr(stdscr, rows_y + idx, box_x + 2, row_text.ljust(box_w-4), attr)
                 footer = "Row 1 switches page. ↑↓ select, ←→ change, Enter/Space run learn/save/clear."
                 safe_addstr(stdscr, box_y + box_h - 2, box_x + 2, footer[:box_w-4], C[6])
+
+                if project_dialog is not None:
+                    dialog_w = min(60, max(40, box_w - 8))
+                    dialog_h = 14
+                    dialog_x = max(3, box_x + (box_w - dialog_w) // 2)
+                    dialog_y = max(3, box_y + 2)
+                    dialog_title = {
+                        "open": "PROJECT OPEN",
+                        "save": "PROJECT SAVE",
+                    }.get(project_dialog["kind"], "PROJECT")
+                    draw_box(stdscr, dialog_y, dialog_x, dialog_w, dialog_h, dialog_title, scope_attr|B)
+                    safe_addstr(stdscr, dialog_y + 1, dialog_x + 2, f"Folder: {PROJECT_DIRNAME}/", C[2])
+                    safe_addstr(stdscr, dialog_y + 2, dialog_x + 2, "File", C[2])
+                    file_attr = C[8]|B if project_dialog["kind"] == "save" else C[3]
+                    filename = project_dialog["file_name"] or (project_dialog["files"][project_dialog["selected_index"]] if project_dialog["files"] else "")
+                    if project_dialog["kind"] == "save":
+                        field_value = project_dialog["file_name"]
+                        cursor_pos = int(clamp(project_dialog.get("cursor_pos", len(field_value)), 0, len(field_value)))
+                        field_w = dialog_w - 12
+                        ext = PROJECT_FILE_EXT
+                        available = max(1, field_w - len(ext))
+                        start = max(0, min(cursor_pos - available + 1, max(0, len(field_value) - available)))
+                        visible = field_value[start:start + available].ljust(available)
+                        safe_addstr(stdscr, dialog_y + 2, dialog_x + 8, visible + ext, C[3])
+                        caret_x = dialog_x + 8 + min(max(0, cursor_pos - start), max(0, available - 1))
+                        caret_ch = visible[min(max(0, cursor_pos - start), max(0, available - 1))] if visible else " "
+                        safe_addstr(stdscr, dialog_y + 2, caret_x, caret_ch, file_attr)
+                    else:
+                        filename = normalize_project_filename(filename)
+                        safe_addstr(stdscr, dialog_y + 2, dialog_x + 8, short_label(filename or "--", dialog_w - 10), file_attr)
+                    safe_addstr(stdscr, dialog_y + 3, dialog_x + 2, "Projects", C[2])
+                    list_h = 5
+                    top_index = 0
+                    if project_dialog["files"]:
+                        top_index = max(0, min(project_dialog["selected_index"] - list_h // 2, max(0, len(project_dialog["files"]) - list_h)))
+                    for row_idx in range(list_h):
+                        file_index = top_index + row_idx
+                        row_y = dialog_y + 4 + row_idx
+                        if file_index < len(project_dialog["files"]):
+                            name = project_dialog["files"][file_index]
+                            attr = (C[8]|B) if file_index == project_dialog["selected_index"] else C[3]
+                            safe_addstr(stdscr, row_y, dialog_x + 4, short_label(name, dialog_w - 8).ljust(dialog_w - 8), attr)
+                        else:
+                            safe_addstr(stdscr, row_y, dialog_x + 4, "".ljust(dialog_w - 8), C[3])
+                    if project_dialog["message"]:
+                        safe_addstr(stdscr, dialog_y + 10, dialog_x + 2, short_label(project_dialog["message"], dialog_w - 4), C[6]|B)
+                    hint = "Type name + Enter to save" if project_dialog["kind"] == "save" else "↑↓ choose file, Enter to open"
+                    safe_addstr(stdscr, dialog_y + 11, dialog_x + 2, short_label(hint, dialog_w - 4), C[6])
+                    safe_addstr(stdscr, dialog_y + 12, dialog_x + 2, "Esc close | Backspace edit | ↑↓ browse", C[6])
 
             stdscr.refresh()
             time.sleep(0.04)
