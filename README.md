@@ -19,6 +19,14 @@ It combines playable synth voices, a step sequencer, live effects, recording too
 git clone git@github.com:sedoy26/mush.git && cd mush && chmod +x mu.sh && ./mu.sh
 ```
 
+Rust runtime:
+
+```bash
+cargo run --manifest-path rust/Cargo.toml -p mush-cli
+```
+
+The Rust runtime now mirrors the main `mush` feature set and uses the same top-level `projects/` and `wav/` folders when run from the repository root.
+
 ## Status
 
 - primary support target: macOS terminal environments
@@ -49,6 +57,7 @@ git clone git@github.com:sedoy26/mush.git && cd mush && chmod +x mu.sh && ./mu.s
 ## Files and folders
 
 - `mu.sh` — launcher and embedded app source of truth
+- `rust/` — structured Rust port with modular runtime and terminal frontend
 - `wav/` — saved mix recordings such as `mush.wav`
 - `projects/` — saved project files using the `.mush` extension
 - `README.md` — project overview and usage notes

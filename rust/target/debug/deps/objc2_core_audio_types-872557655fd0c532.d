@@ -1,0 +1,10 @@
+/Users/gg/workspace/music/mush/rust/target/debug/deps/libobjc2_core_audio_types-872557655fd0c532.rmeta: /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/lib.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/base_types.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/generated/mod.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/generated/CoreAudioBaseTypes.rs
+
+/Users/gg/workspace/music/mush/rust/target/debug/deps/libobjc2_core_audio_types-872557655fd0c532.rlib: /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/lib.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/base_types.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/generated/mod.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/generated/CoreAudioBaseTypes.rs
+
+/Users/gg/workspace/music/mush/rust/target/debug/deps/objc2_core_audio_types-872557655fd0c532.d: /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/lib.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/base_types.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/generated/mod.rs /Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/generated/CoreAudioBaseTypes.rs
+
+/Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/lib.rs:
+/Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/base_types.rs:
+/Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/generated/mod.rs:
+/Users/gg/.cargo/registry/src/index.crates.io-6f17d22bba15001f/objc2-core-audio-types-0.3.2/src/generated/CoreAudioBaseTypes.rs:

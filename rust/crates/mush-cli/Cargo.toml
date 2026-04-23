@@ -1,0 +1,15 @@
+[package]
+name = "mush-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "mush-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+crossterm = "0.28.1"
+mush-core = { path = "../mush-core" }
+parking_lot = "0.12.5"
