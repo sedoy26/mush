@@ -17,11 +17,13 @@ pub const MAX_FEEDBACK: f32 = 0.95;
 /// 
 /// - drive > 1.0 gives soft saturation
 /// - The division by tanh(drive) normalizes so that small signals pass through ~unchanged
-/// - ceiling sets the output maximum
+/// - ceiling sets the output maximum (GUARANTEED via final clamp)
 #[inline]
 pub fn soft_limit(sample: f32, drive: f32, ceiling: f32) -> f32 {
     let drive = drive.max(1.0);
-    (sample * drive).tanh() / drive.tanh() * ceiling
+    let result = (sample * drive).tanh() / drive.tanh() * ceiling;
+    // CRITICAL: clamp to guarantee ceiling - the tanh math can exceed ceiling when drive > 1
+    result.clamp(-ceiling, ceiling)
 }
 
 /// Calculate exponential decay coefficient for a given time constant.

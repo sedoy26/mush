@@ -33,11 +33,18 @@ use crate::{
 
 // Constants that don't depend on sample rate
 const MAX_LOOP_SECONDS: usize = 8;
-const LIMIT_CEILING: f32 = 0.92;
-const LIMIT_DRIVE: f32 = 1.5;  // Soft saturation amount
-const OUTPUT_GAIN: f32 = 0.46;
-const SYNTH_BUS_GAIN: f32 = 0.68;
-const DRUM_BUS_GAIN: f32 = 0.30;
+const LIMIT_CEILING: f32 = 0.85;   // More aggressive ceiling
+const LIMIT_DRIVE: f32 = 2.0;      // Stronger saturation curve
+const OUTPUT_GAIN: f32 = 0.35;     // Reduced master output
+const SYNTH_BUS_GAIN: f32 = 0.55;  // Reduced synth
+const DRUM_BUS_GAIN: f32 = 0.28;   // Drums post-synth-FX; bus still soft-limited
+const DRUM_VOICE_GAIN: f32 = 0.40; // Per-voice trim; kick multiplies by KICK_VOICE_GAIN_MUL
+const KICK_VOICE_GAIN_MUL: f32 = 1.52; // Extra fader path for kick vs other voices
+const KICK_ATTACK_MS: f32 = 2.8;   // Short enough for punch; tail fade handles cutoff
+const KICK_LEVEL: f32 = 0.62;      // Base synthesis gain; kick_makeup() evens banks
+// Filter frequency range (exponential mapping)
+const FILTER_MIN_FREQ: f32 = 20.0;    // 20 Hz minimum
+const FILTER_MAX_FREQ: f32 = 18000.0; // 18 kHz maximum (leave headroom below Nyquist)
 
 pub struct AudioRuntime {
     pub stream: cpal::Stream,
@@ -286,12 +293,13 @@ fn render_callback(
         }
     }
 
-    // Write mono to stereo output
+    // Write mono to stereo output with final safety clamp
     for (frame, sample) in mono.into_iter().enumerate() {
         let base = frame * channels;
-        data[base] = sample;
+        let clamped = sample.clamp(-0.98, 0.98);
+        data[base] = clamped;
         if channels > 1 {
-            data[base + 1] = sample;
+            data[base + 1] = clamped;
         }
     }
 }
@@ -345,8 +353,55 @@ fn render_callback_core(
     }
 }
 
+#[derive(Clone, Copy)]
 struct DrumVoiceState {
     age: Option<usize>,
+    last_value: f32,        // Track last output for crossfade on retrigger
+    crossfade_from: f32,    // Value to crossfade from on retrigger
+    crossfade_samples: usize, // Samples remaining in crossfade
+    /// Integrated phase for kick (frequency sweeps must use ∫2πf dt, not f(t)·t)
+    kick_phase: f32,
+}
+
+const DRUM_CROSSFADE_SAMPLES: usize = 64; // ~1.3ms at 48kHz - fast enough to not lose transient
+/// Fade out the last few ms of each drum voice — hard age cutoff vs ongoing envelope causes a click.
+const DRUM_TAIL_FADE_SAMPLES: usize = 220; // ~4.6ms @ 48kHz
+
+/// Banks with low fundamental / weak click read much quieter at the same peak; lift in a bounded way.
+#[inline]
+fn kick_makeup(p: &crate::state::drums::KickParams) -> f32 {
+    // Sub-heavy kicks (low base_freq) need more level to match perceived punch on typical speakers.
+    let ref_hz = 52.0f32;
+    let freq_lift = (ref_hz / p.base_freq.max(26.0)).sqrt().clamp(1.0, 2.15);
+    // Small `click` → little energy in the audible attack band.
+    let click_lift = (1.05 + (0.11 - p.click).max(0.0) * 2.8).clamp(1.0, 1.48);
+    (freq_lift * click_lift).clamp(1.0, 2.25)
+}
+
+/// Kick body: phase must integrate 2πf(t)/sr each sample when f sweeps (not 2πf(t)·t).
+fn kick_sample_osc(
+    sample_rate: f32,
+    phase: &mut f32,
+    t: f32,
+    noise: f32,
+    p: &crate::state::drums::KickParams,
+) -> f32 {
+    let pitch_env = (-t / p.pitch_decay).exp();
+    let freq = p.base_freq + (p.sweep_freq - p.base_freq) * pitch_env;
+    *phase += 2.0 * PI * freq / sample_rate;
+    let tone = phase.sin();
+    let click_env = (-t / (p.click_decay * 0.5)).exp();
+    let click = noise * p.click * 0.48 * click_env;
+    let amp_env = (-t / p.amp_decay).exp();
+    // Smooth attack ramp using cosine curve (softer than linear)
+    let attack_time = KICK_ATTACK_MS / 1000.0;
+    let attack_env = if t < attack_time {
+        0.5 - 0.5 * (PI * t / attack_time).cos() // Cosine fade-in
+    } else {
+        1.0
+    };
+    let makeup = kick_makeup(p);
+    ((tone + click) * amp_env * attack_env * KICK_LEVEL * makeup).clamp(-1.0, 1.0)
 }
 
 struct AudioEngine {
@@ -422,12 +477,12 @@ impl AudioEngine {
             last_output: 0.0,
             osc_phases: [[0.0; 6]; 2],
             drum_state: [
-                DrumVoiceState { age: None },
-                DrumVoiceState { age: None },
-                DrumVoiceState { age: None },
-                DrumVoiceState { age: None },
-                DrumVoiceState { age: None },
-                DrumVoiceState { age: None },
+                DrumVoiceState { age: None, last_value: 0.0, crossfade_from: 0.0, crossfade_samples: 0, kick_phase: 0.0 },
+                DrumVoiceState { age: None, last_value: 0.0, crossfade_from: 0.0, crossfade_samples: 0, kick_phase: 0.0 },
+                DrumVoiceState { age: None, last_value: 0.0, crossfade_from: 0.0, crossfade_samples: 0, kick_phase: 0.0 },
+                DrumVoiceState { age: None, last_value: 0.0, crossfade_from: 0.0, crossfade_samples: 0, kick_phase: 0.0 },
+                DrumVoiceState { age: None, last_value: 0.0, crossfade_from: 0.0, crossfade_samples: 0, kick_phase: 0.0 },
+                DrumVoiceState { age: None, last_value: 0.0, crossfade_from: 0.0, crossfade_samples: 0, kick_phase: 0.0 },
             ],
             drum_noise: 0x1234_5678,
             seq_accum: 0.0,
@@ -551,12 +606,14 @@ impl AudioEngine {
             // Smooth gain toward target
             self.current_gain += (target_gain - self.current_gain) * gain_alpha;
             synth_samples[i] = (synth_out[i] + loop_out[i]) * self.current_gain * SYNTH_BUS_GAIN;
-            let mut mixed = synth_samples[i] + drum_out[i] * DRUM_BUS_GAIN;
-            mixed = self.apply_fx_sample(mixed, &params.synth);
+            // FX (drive/delay/reverb) on synth+loop only — drums stay clean and avoid limiter pile-up
+            let wet_synth = self.apply_fx_sample(synth_samples[i], &params.synth);
+            let mut mixed = wet_synth + drum_out[i] * DRUM_BUS_GAIN;
             // Continuous soft limiting - applied to ALL samples, no conditional
             mixed = dsp::soft_limit(mixed, LIMIT_DRIVE, LIMIT_CEILING) * OUTPUT_GAIN;
-            out[i] = mixed;
-            self.push_scope(mixed);
+            // FINAL HARD CLAMP - absolutely prevent any sample from exceeding -1.0 to 1.0
+            out[i] = mixed.clamp(-0.98, 0.98);
+            self.push_scope(out[i]);
         }
 
         self.update_recording(params.global_recording, out);
@@ -629,7 +686,16 @@ impl AudioEngine {
                 // Smooth cutoff changes to prevent zipper noise (~5ms smoothing)
                 let cutoff_alpha = dsp::attack_coeff(0.005, self.sample_rate);
                 self.current_cutoff += (target_cutoff - self.current_cutoff) * cutoff_alpha;
-                let alpha = self.current_cutoff * self.current_cutoff;
+                
+                // Convert normalized 0-1 cutoff to actual frequency (exponential mapping)
+                // This gives musically useful range: 20Hz at 0.0, 18kHz at 1.0
+                let cutoff_freq = FILTER_MIN_FREQ * (FILTER_MAX_FREQ / FILTER_MIN_FREQ).powf(self.current_cutoff);
+                
+                // Calculate proper one-pole lowpass coefficient from frequency
+                // alpha = 1 - exp(-2π * fc / sr) for accurate coefficient
+                let omega = 2.0 * std::f32::consts::PI * cutoff_freq / self.sample_rate;
+                let alpha = (1.0 - (-omega).exp()).clamp(0.0001, 0.9999);
+                
                 self.filter_z1 += (value - self.filter_z1) * alpha;
                 value = self.filter_z1;
             }
@@ -796,7 +862,13 @@ impl AudioEngine {
         // Process triggers from params (manual/MIDI triggers)
         for voice in DrumVoice::ALL {
             if drums.triggers[voice.index()] {
-                self.drum_state[voice.index()].age = Some(0);
+                let state = &mut self.drum_state[voice.index()];
+                // If already playing, setup crossfade from current value
+                if state.age.is_some() {
+                    state.crossfade_from = state.last_value;
+                    state.crossfade_samples = DRUM_CROSSFADE_SAMPLES;
+                }
+                state.age = Some(0);
                 self.drum_triggered[voice.index()] = true;
             }
         }
@@ -830,7 +902,13 @@ impl AudioEngine {
                     // Trigger drums on this step
                     for voice in DrumVoice::ALL {
                         if playing_steps[voice.index()][self.seq_step] {
-                            self.drum_state[voice.index()].age = Some(0);
+                            let state = &mut self.drum_state[voice.index()];
+                            // If already playing, setup crossfade from current value
+                            if state.age.is_some() {
+                                state.crossfade_from = state.last_value;
+                                state.crossfade_samples = DRUM_CROSSFADE_SAMPLES;
+                            }
+                            state.age = Some(0);
                             self.drum_triggered[voice.index()] = true;
                         }
                     }
@@ -846,10 +924,26 @@ impl AudioEngine {
 
             let mut mix = 0.0;
             for voice in DrumVoice::ALL {
-                if let Some(age) = self.drum_state[voice.index()].age {
-                    let sample_val = self.drum_voice_sample(voice, age, drums.bank);
-                    mix += sample_val * drums.volumes[voice.index()] * 0.5;
-                    let next_age = age + 1;
+                let idx = voice.index();
+                // First, read state and get the sample (no mutable borrow yet)
+                let (age_opt, crossfade_from, crossfade_remaining) = {
+                    let s = &self.drum_state[idx];
+                    (s.age, s.crossfade_from, s.crossfade_samples)
+                };
+                
+                if let Some(age) = age_opt {
+                    // Get sample (needs &mut self for noise)
+                    let raw_sample = self.drum_voice_sample(voice, age, drums.bank, idx);
+                    
+                    // Apply crossfade if retriggering
+                    let mut sample_val = if crossfade_remaining > 0 {
+                        let t = crossfade_remaining as f32 / DRUM_CROSSFADE_SAMPLES as f32;
+                        // Crossfade: old value * t + new value * (1-t)
+                        crossfade_from * t + raw_sample * (1.0 - t)
+                    } else {
+                        raw_sample
+                    };
+
                     let limit = match voice {
                         DrumVoice::Kick => 8_000,
                         DrumVoice::Snare => 6_000,
@@ -858,38 +952,58 @@ impl AudioEngine {
                         DrumVoice::Tom => 7_000,
                         DrumVoice::Cymbal => 8_500,
                     };
-                    self.drum_state[voice.index()].age = (next_age < limit).then_some(next_age);
+                    let fade_len = DRUM_TAIL_FADE_SAMPLES.min(limit).max(32);
+                    let samples_left = limit.saturating_sub(age);
+                    if samples_left < fade_len {
+                        let u = (fade_len - samples_left) as f32 / fade_len as f32;
+                        // Cosine ramp to 0 at cutoff — removes post-hit clip when envelope is still non-zero
+                        sample_val *= 0.5 * (1.0 + (PI * u).cos());
+                    }
+
+                    // Now update state (mutable borrow)
+                    let state = &mut self.drum_state[idx];
+                    if crossfade_remaining > 0 {
+                        state.crossfade_samples = crossfade_remaining - 1;
+                    }
+                    state.last_value = sample_val;
+
+                    let vgain = if matches!(voice, DrumVoice::Kick) {
+                        DRUM_VOICE_GAIN * KICK_VOICE_GAIN_MUL
+                    } else {
+                        DRUM_VOICE_GAIN
+                    };
+                    let voice_level = sample_val * drums.volumes[idx] * vgain;
+                    mix += voice_level;
+
+                    let next_age = age + 1;
+                    state.age = (next_age < limit).then_some(next_age);
                 }
             }
-            *sample = mix;
+            // Single gentle bus cap (per-voice limiters removed to reduce hashy saturation)
+            *sample = dsp::soft_limit(mix, 1.12, 0.98);
         }
 
         out
     }
 
-    fn drum_voice_sample(&mut self, voice: DrumVoice, age: usize, bank: usize) -> f32 {
+    fn drum_voice_sample(&mut self, voice: DrumVoice, age: usize, bank: usize, voice_idx: usize) -> f32 {
         let t = age as f32 / self.sample_rate;
         let noise = self.noise();
         let b = get_bank(bank);
         match voice {
-            DrumVoice::Kick => self.kick_sample(t, noise, &b.kick),
+            DrumVoice::Kick => {
+                let phase = &mut self.drum_state[voice_idx].kick_phase;
+                if age == 0 {
+                    *phase = 0.0;
+                }
+                kick_sample_osc(self.sample_rate, phase, t, noise, &b.kick)
+            }
             DrumVoice::Snare => self.snare_sample(t, noise, &b.snare),
             DrumVoice::Clap => self.clap_sample(t, noise, b.clap_decay),
             DrumVoice::HiHat => self.hihat_sample(t, noise, &b.hihat),
             DrumVoice::Tom => self.tom_sample(t, b.tom_base, b.tom_decay),
             DrumVoice::Cymbal => self.cymbal_sample(t, noise, &b.cymbal),
         }
-    }
-
-    fn kick_sample(&self, t: f32, noise: f32, p: &crate::state::drums::KickParams) -> f32 {
-        let pitch_env = (-t / p.pitch_decay).exp();
-        let freq = p.base_freq + (p.sweep_freq - p.base_freq) * pitch_env;
-        let phase = 2.0 * PI * freq * t;
-        let tone = phase.sin();
-        let click_env = (-t / p.click_decay).exp();
-        let click = noise * p.click * click_env;
-        let amp_env = (-t / p.amp_decay).exp();
-        (tone + click) * amp_env
     }
 
     fn snare_sample(&self, t: f32, noise: f32, p: &crate::state::drums::SnareParams) -> f32 {
