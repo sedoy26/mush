@@ -2637,13 +2637,17 @@ fn cycle_audio_selection(
         *selection = AudioDeviceSelection::DefaultSystem;
         return;
     }
+    // Ring: 0 = Default OS, 1..=n = devices[0..n-1]. (Do not use device index 0 for both Default and
+    // first device — that made ← work but → never advance past the first named output/input.)
+    let n = devices.len() as i32;
     let current = match selection {
-        AudioDeviceSelection::DefaultSystem => 0,
+        AudioDeviceSelection::DefaultSystem => 0i32,
         AudioDeviceSelection::Named(name) => {
-            devices.iter().position(|d| &d.name == name).unwrap_or(0)
+            let idx = devices.iter().position(|d| &d.name == name).unwrap_or(0) as i32;
+            idx + 1
         }
     };
-    let next = (current as i32 + delta).rem_euclid((devices.len() + 1) as i32);
+    let next = (current + delta).rem_euclid(n + 1);
     if next == 0 {
         *selection = AudioDeviceSelection::DefaultSystem;
     } else {
