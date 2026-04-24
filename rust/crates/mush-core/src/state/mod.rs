@@ -12,6 +12,8 @@ pub const MAX_OSCILLATORS: usize = 2;
 pub const MAX_VOICES: usize = 6;
 pub const NUM_DRUM_VOICES: usize = 6;
 pub const NUM_STEPS: usize = 32;
+pub const NUM_PATTERNS: usize = 8;
+pub const MAX_CHAIN_LENGTH: usize = 64;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

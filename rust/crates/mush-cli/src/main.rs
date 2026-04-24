@@ -18,7 +18,7 @@ use mush_core::state::{
     project::ProjectTarget,
     synth::Waveform,
     ui::{SettingsPage, Theme, VisualFx, VisualMode},
-    AppState, MAX_VOICES, NUM_STEPS,
+    AppState, MAX_VOICES, NUM_PATTERNS, NUM_STEPS,
 };
 use mush_core::visuals::{Framebuffer, VisualRegistry};
 use mush_core::camera::apply_visual_fx;
@@ -586,6 +586,13 @@ fn handle_synth_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) 
         KeyCode::Char('U') => {
             state.looper.clear();
         }
+        // Chain mode toggle (available in synth mode too)
+        KeyCode::Char('\\') => {
+            state.drums.chain_mode = !state.drums.chain_mode;
+        }
+        KeyCode::Char('|') => {
+            state.drums.chain_push(state.drums.current_pattern);
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             ui.should_quit = true
         }
@@ -662,7 +669,8 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
         }
         KeyCode::Char(' ') => {
             clear_confirm(ui);
-            let value = &mut state.drums.steps[ui.drum_voice][ui.drum_step];
+            let pattern = state.drums.current_pattern;
+            let value = &mut state.drums.patterns[pattern][ui.drum_voice][ui.drum_step];
             *value = !*value;
         }
         KeyCode::Char('r') | KeyCode::Enter => {
@@ -800,6 +808,60 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
             clear_confirm(ui);
             state.looper.playback_speed = (state.looper.playback_speed / 1.1).clamp(0.25, 4.0)
         }
+        // Pattern navigation: { and } to cycle patterns
+        KeyCode::Char('{') => {
+            clear_confirm(ui);
+            state.drums.current_pattern = state.drums.current_pattern.saturating_sub(1);
+            set_notice(ui, format!("Editing pattern {}", state.drums.current_pattern + 1));
+        }
+        KeyCode::Char('}') => {
+            clear_confirm(ui);
+            state.drums.current_pattern = (state.drums.current_pattern + 1).min(NUM_PATTERNS - 1);
+            set_notice(ui, format!("Editing pattern {}", state.drums.current_pattern + 1));
+        }
+        // Chain controls: \ toggles chain mode
+        KeyCode::Char('\\') => {
+            clear_confirm(ui);
+            state.drums.chain_mode = !state.drums.chain_mode;
+            set_notice(ui, format!("Chain mode {}", if state.drums.chain_mode { "ON" } else { "OFF" }));
+        }
+        // | (shift+\) adds current pattern to chain
+        KeyCode::Char('|') => {
+            clear_confirm(ui);
+            state.drums.chain_push(state.drums.current_pattern);
+            set_notice(ui, format!("Added pattern {} to chain (len={})", state.drums.current_pattern + 1, state.drums.chain.len()));
+        }
+        // Backspace removes last pattern from chain
+        KeyCode::Backspace => {
+            clear_confirm(ui);
+            if !state.drums.chain.is_empty() {
+                state.drums.chain_pop();
+                set_notice(ui, format!("Removed from chain (len={})", state.drums.chain.len()));
+            }
+        }
+        // Delete clears chain
+        KeyCode::Delete => {
+            clear_confirm(ui);
+            state.drums.chain_clear();
+            set_notice(ui, "Chain cleared".to_string());
+        }
+        // Copy pattern: ( copies current pattern to prev, ) copies to next
+        KeyCode::Char('(') => {
+            clear_confirm(ui);
+            if state.drums.current_pattern > 0 {
+                let dest = state.drums.current_pattern - 1;
+                state.drums.copy_pattern_to(dest);
+                set_notice(ui, format!("Copied pattern {} to {}", state.drums.current_pattern + 1, dest + 1));
+            }
+        }
+        KeyCode::Char(')') => {
+            clear_confirm(ui);
+            if state.drums.current_pattern < NUM_PATTERNS - 1 {
+                let dest = state.drums.current_pattern + 1;
+                state.drums.copy_pattern_to(dest);
+                set_notice(ui, format!("Copied pattern {} to {}", state.drums.current_pattern + 1, dest + 1));
+            }
+        }
         _ => {}
     }
 }
@@ -876,8 +938,9 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     let visual_width = right_w.saturating_sub(2).max(24);  // 2 for box borders (1 each side)
     canvas.boxed_style(left_x, 2, left_w, 12, " OSC ", UiStyle::Scope);
     canvas.boxed_style(left_x, 15, left_w, 9, " FX ", UiStyle::Scope);
+    canvas.boxed_style(left_x, 24, left_w, 5, " SONG ", UiStyle::Scope);
     let drum_h = 10;
-    let drum_top = term_h.saturating_sub(drum_h).max(25);
+    let drum_top = term_h.saturating_sub(drum_h).max(30);
     let footer_y = drum_top.saturating_sub(1);
     let visual_box_h = drum_top.saturating_sub(3).max(6);
     canvas.boxed_style(
@@ -1120,6 +1183,63 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(left_x + 20, 22, "Rev", UiStyle::Label);
     canvas.text_style(left_x + 24, 22, &format!("{:.2}", state.synth.fx.reverb), UiStyle::Value);
 
+    // SONG section - row 25: Pattern selector (1-8)
+    canvas.text_style(left_x + 2, 25, "PAT", UiStyle::Label);
+    for p in 0..NUM_PATTERNS {
+        let is_current = p == state.drums.current_pattern;
+        let label = if is_current {
+            format!("[{}]", p + 1)
+        } else {
+            format!(" {} ", p + 1)
+        };
+        canvas.text_style(
+            left_x + 6 + (p * 3),
+            25,
+            &label,
+            if is_current { UiStyle::Active } else { UiStyle::Value },
+        );
+    }
+
+    // SONG section - row 26: Chain sequence
+    canvas.text_style(left_x + 2, 26, "CHN", UiStyle::Label);
+    canvas.text_style(
+        left_x + 6,
+        26,
+        if state.drums.chain_mode { "ON " } else { "OFF" },
+        if state.drums.chain_mode { UiStyle::Active } else { UiStyle::Hint },
+    );
+    // Display chain sequence (fits in remaining width)
+    let chain_display_width = left_w.saturating_sub(12);
+    let chain_str: String = if state.drums.chain.is_empty() {
+        "-- empty --".to_string()
+    } else {
+        state.drums.chain.iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if state.drums.chain_mode && i == state.drums.chain_position {
+                    format!("[{}]", p + 1)
+                } else {
+                    format!("{}", p + 1)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("→")
+    };
+    canvas.text_style(
+        left_x + 10,
+        26,
+        &short_label(&chain_str, chain_display_width),
+        UiStyle::Value,
+    );
+
+    // SONG section - row 27: Hints
+    canvas.text_style(
+        left_x + 2,
+        27,
+        &short_label("{/} pat  |add  BS rem  \\ mode", left_w.saturating_sub(4)),
+        UiStyle::Hint,
+    );
+
     let visual_render_h = visual_box_h.saturating_sub(4).max(1);
     
     // Resize framebuffer if dimensions changed
@@ -1251,7 +1371,8 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         }
     }
 
-    for (idx, row) in state.drums.steps.iter().enumerate() {
+    let editing_pattern = &state.drums.patterns[state.drums.current_pattern];
+    for (idx, row) in editing_pattern.iter().enumerate() {
         let row_selected = matches!(ui.focus, Focus::Drums) && idx == ui.drum_voice;
         canvas.text_style(
             3,
@@ -1307,7 +1428,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
                 "BPM {:.1}  RUN {}  STEP {:02}  {}  WAV {}  LAST {}",
                 state.drums.bpm,
                 if state.drums.running { "ON " } else { "OFF" },
-                state.drums.current_step,
+                state.drums.current_step + 1,
                 get_bank(state.drums.bank).name,
                 if state.audio.global_recording.recording {
                     "REC"
@@ -1330,9 +1451,9 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         "Row 1 switches page. Use [ and ] to page through tabs. ↑↓ select, ←→ change, Enter/Space run. S/Esc close."
             .to_string()
     } else if matches!(ui.focus, Focus::Synth) {
-        "TAB=drums | R/T/Y/P/U loop | I/O gain | @# start | $% end | ^& speed | G wav | S settings".to_string()
+        "TAB=drums | R/T/Y/P/U loop | \\ chain | | add | G wav | S settings".to_string()
     } else {
-        "TAB=synth | ←→↑↓ move | SPC toggle | r/Enter run | c/X double press | 1/2 patterns | S settings | q quit"
+        "TAB=synth | ←→↑↓ move | SPC toggle | r run | {/} pattern | \\ chain | | add | BS rem | S settings"
             .to_string()
     };
     canvas.text(5, footer_y, &footer);
@@ -1743,28 +1864,29 @@ fn drum_notice_text(ui: &UiLocalState) -> Option<&str> {
 }
 
 fn apply_pattern(state: &mut AppState, pattern: usize) {
-    state.drums.steps = [[false; 32]; 6];
+    let p = state.drums.current_pattern;
+    state.drums.patterns[p] = [[false; 32]; 6];
     match pattern {
         0 => {
             for step in [0, 8, 16, 24] {
-                state.drums.steps[0][step] = true;
+                state.drums.patterns[p][0][step] = true;
             }
             for step in [4, 12, 20, 28] {
-                state.drums.steps[1][step] = true;
+                state.drums.patterns[p][1][step] = true;
             }
             for step in (0..32).step_by(2) {
-                state.drums.steps[3][step] = true;
+                state.drums.patterns[p][3][step] = true;
             }
         }
         _ => {
             for step in [0, 11, 16, 24] {
-                state.drums.steps[0][step] = true;
+                state.drums.patterns[p][0][step] = true;
             }
             for step in [4, 12, 20, 28] {
-                state.drums.steps[1][step] = true;
+                state.drums.patterns[p][1][step] = true;
             }
             for step in [7, 15, 23, 31] {
-                state.drums.steps[4][step] = true;
+                state.drums.patterns[p][4][step] = true;
             }
         }
     }

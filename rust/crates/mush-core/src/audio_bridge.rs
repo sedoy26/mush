@@ -144,6 +144,10 @@ pub struct ReactiveState {
     // Drum sequencer state
     pub drum_step: AtomicU32,
     pub drum_triggers: [AtomicU32; 6], // bool as u32 for each voice
+    /// Current position in chain (0-based)
+    pub chain_position: AtomicU32,
+    /// Pattern index currently playing
+    pub playing_pattern: AtomicU32,
 }
 
 impl ReactiveState {
@@ -347,6 +351,7 @@ impl AudioBridge {
 
         // Drum sequencer step position (for UI cursor display)
         state.drums.current_step = self.reactive.drum_step.load(Ordering::Relaxed) as usize;
+        state.drums.chain_position = self.reactive.chain_position.load(Ordering::Relaxed) as usize;
         // Note: We do NOT sync drum_triggers back - that would create a feedback loop
         // The reactive.kick/snare/hat fields already provide visual feedback for drums
 

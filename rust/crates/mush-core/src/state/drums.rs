@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{NUM_DRUM_VOICES, NUM_STEPS};
+use super::{NUM_DRUM_VOICES, NUM_PATTERNS, NUM_STEPS, MAX_CHAIN_LENGTH};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DrumVoice {
@@ -312,48 +312,145 @@ pub fn get_bank(index: usize) -> &'static DrumBank {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DrumState {
-    pub steps: [[bool; NUM_STEPS]; NUM_DRUM_VOICES],
+    /// All patterns: patterns[pattern_idx][voice][step]
+    pub patterns: [[[bool; NUM_STEPS]; NUM_DRUM_VOICES]; NUM_PATTERNS],
+    /// Currently selected pattern for editing (0-7)
+    pub current_pattern: usize,
+    /// Volumes per voice
     #[serde(alias = "vol")]
     pub volumes: [f32; NUM_DRUM_VOICES],
+    /// Whether sequencer is running
     pub running: bool,
+    /// Beats per minute
     pub bpm: f32,
+    /// Current step position within the playing pattern
     #[serde(default)]
     pub current_step: usize,
+    /// Selected drum bank
     pub bank: usize,
+    /// Manual triggers (from keyboard/MIDI)
     #[serde(default)]
     pub triggers: [bool; NUM_DRUM_VOICES],
+    /// Chain of pattern indices to play in order
+    #[serde(default)]
+    pub chain: Vec<usize>,
+    /// Current position in chain during playback
+    #[serde(default)]
+    pub chain_position: usize,
+    /// Whether chain mode is active (vs single pattern loop)
+    #[serde(default)]
+    pub chain_mode: bool,
 }
 
 impl DrumState {
+    /// Get reference to current pattern's steps
+    pub fn steps(&self) -> &[[bool; NUM_STEPS]; NUM_DRUM_VOICES] {
+        &self.patterns[self.current_pattern]
+    }
+
+    /// Get mutable reference to current pattern's steps
+    pub fn steps_mut(&mut self) -> &mut [[bool; NUM_STEPS]; NUM_DRUM_VOICES] {
+        &mut self.patterns[self.current_pattern]
+    }
+
+    /// Get the pattern that should currently be playing
+    pub fn playing_pattern(&self) -> usize {
+        if self.chain_mode && !self.chain.is_empty() {
+            self.chain[self.chain_position % self.chain.len()]
+        } else {
+            self.current_pattern
+        }
+    }
+
+    /// Get steps for the currently playing pattern
+    pub fn playing_steps(&self) -> &[[bool; NUM_STEPS]; NUM_DRUM_VOICES] {
+        &self.patterns[self.playing_pattern()]
+    }
+
     pub fn set_step(&mut self, voice: DrumVoice, step: usize, enabled: bool) {
         if step < NUM_STEPS {
-            self.steps[voice.index()][step] = enabled;
+            self.patterns[self.current_pattern][voice.index()][step] = enabled;
         }
     }
 
     pub fn clear_voice(&mut self, voice: DrumVoice) {
-        self.steps[voice.index()] = [false; NUM_STEPS];
+        self.patterns[self.current_pattern][voice.index()] = [false; NUM_STEPS];
     }
 
+    pub fn clear_pattern(&mut self) {
+        self.patterns[self.current_pattern] = [[false; NUM_STEPS]; NUM_DRUM_VOICES];
+    }
+
+    /// Clear current pattern (alias for clear_pattern for backward compat)
     pub fn clear_all(&mut self) {
-        self.steps = [[false; NUM_STEPS]; NUM_DRUM_VOICES];
+        self.clear_pattern();
+    }
+
+    pub fn clear_all_patterns(&mut self) {
+        self.patterns = [[[false; NUM_STEPS]; NUM_DRUM_VOICES]; NUM_PATTERNS];
     }
 
     pub fn set_level(&mut self, voice: DrumVoice, level: f32) {
         self.volumes[voice.index()] = level.clamp(0.0, 1.0);
+    }
+
+    /// Advance to next pattern in chain, returns true if chain wrapped
+    pub fn advance_chain(&mut self) -> bool {
+        if self.chain.is_empty() {
+            return false;
+        }
+        self.chain_position += 1;
+        if self.chain_position >= self.chain.len() {
+            self.chain_position = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Add a pattern to the chain
+    pub fn chain_push(&mut self, pattern: usize) {
+        if self.chain.len() < MAX_CHAIN_LENGTH && pattern < NUM_PATTERNS {
+            self.chain.push(pattern);
+        }
+    }
+
+    /// Remove last pattern from chain
+    pub fn chain_pop(&mut self) {
+        self.chain.pop();
+        if self.chain_position >= self.chain.len() && !self.chain.is_empty() {
+            self.chain_position = self.chain.len() - 1;
+        }
+    }
+
+    /// Clear the chain
+    pub fn chain_clear(&mut self) {
+        self.chain.clear();
+        self.chain_position = 0;
+    }
+
+    /// Copy current pattern to another slot
+    pub fn copy_pattern_to(&mut self, dest: usize) {
+        if dest < NUM_PATTERNS && dest != self.current_pattern {
+            self.patterns[dest] = self.patterns[self.current_pattern];
+        }
     }
 }
 
 impl Default for DrumState {
     fn default() -> Self {
         Self {
-            steps: [[false; NUM_STEPS]; NUM_DRUM_VOICES],
+            patterns: [[[false; NUM_STEPS]; NUM_DRUM_VOICES]; NUM_PATTERNS],
+            current_pattern: 0,
             volumes: [1.0; NUM_DRUM_VOICES],
             running: false,
             bpm: 120.0,
             current_step: 0,
             bank: 0,
             triggers: [false; NUM_DRUM_VOICES],
+            chain: Vec::new(),
+            chain_position: 0,
+            chain_mode: false,
         }
     }
 }

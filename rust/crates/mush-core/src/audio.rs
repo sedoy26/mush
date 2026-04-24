@@ -270,6 +270,14 @@ fn render_callback(
         
         // Update drum sequencer state atomics
         bridge.reactive.drum_step.store(engine.seq_step as u32, std::sync::atomic::Ordering::Relaxed);
+        bridge.reactive.chain_position.store(engine.chain_position as u32, std::sync::atomic::Ordering::Relaxed);
+        // Calculate playing pattern for UI display
+        let playing_pattern = if params.drums.chain_mode && !params.drums.chain.is_empty() {
+            params.drums.chain[engine.chain_position % params.drums.chain.len()]
+        } else {
+            params.drums.current_pattern
+        };
+        bridge.reactive.playing_pattern.store(playing_pattern as u32, std::sync::atomic::Ordering::Relaxed);
         for i in 0..6 {
             bridge.reactive.drum_triggers[i].store(
                 if engine.drum_triggered[i] { 1 } else { 0 },
@@ -369,6 +377,10 @@ struct AudioEngine {
     drum_noise: u32,
     seq_accum: f32,
     seq_step: usize,
+    /// Current position in pattern chain
+    chain_position: usize,
+    /// Cached chain length (to detect changes)
+    chain_len: usize,
     rec_buffer: Vec<f32>,
     was_recording: bool,
     pending_record_flush: bool,
@@ -420,6 +432,8 @@ impl AudioEngine {
             drum_noise: 0x1234_5678,
             seq_accum: 0.0,
             seq_step: 0,
+            chain_position: 0,
+            chain_len: 0,
             rec_buffer: Vec::new(),
             was_recording: false,
             pending_record_flush: false,
@@ -787,18 +801,46 @@ impl AudioEngine {
             }
         }
 
+        // Sync chain state when chain changes
+        if drums.chain.len() != self.chain_len {
+            self.chain_len = drums.chain.len();
+            // Reset chain position if it's out of bounds
+            if self.chain_position >= self.chain_len && self.chain_len > 0 {
+                self.chain_position = 0;
+            }
+        }
+
+        // Get the pattern that should be playing
+        let playing_pattern = if drums.chain_mode && !drums.chain.is_empty() {
+            drums.chain[self.chain_position % drums.chain.len()]
+        } else {
+            drums.current_pattern
+        };
+        let playing_steps = &drums.patterns[playing_pattern];
+
         for sample in &mut out {
             if drums.running {
                 self.seq_accum += 1.0;
                 if self.seq_accum >= step_samples {
                     self.seq_accum -= step_samples;
+                    
+                    // Check if pattern is wrapping (last step -> first step)
+                    let was_last_step = self.seq_step == NUM_STEPS - 1;
+                    
+                    // Trigger drums on this step
                     for voice in DrumVoice::ALL {
-                        if drums.steps[voice.index()][self.seq_step] {
+                        if playing_steps[voice.index()][self.seq_step] {
                             self.drum_state[voice.index()].age = Some(0);
                             self.drum_triggered[voice.index()] = true;
                         }
                     }
+                    
                     self.seq_step = (self.seq_step + 1) % NUM_STEPS;
+                    
+                    // Advance chain when pattern completes
+                    if was_last_step && drums.chain_mode && !drums.chain.is_empty() {
+                        self.chain_position = (self.chain_position + 1) % drums.chain.len();
+                    }
                 }
             }
 
