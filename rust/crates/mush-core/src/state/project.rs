@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    audio::AudioState, drums::DrumState, looper::LoopSnapshot, midi::MidiState, synth::SynthState,
-    ui::UiState,
+    audio::AudioState, drums::DrumState, looper::LoopSnapshot, midi::MidiState, sample::SampleState,
+    synth::SynthState, ui::UiState,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -16,6 +16,7 @@ pub struct ProjectData {
     pub synth: SynthState,
     pub drums: DrumState,
     pub looper: LoopSnapshot,
+    pub sample: SampleState,
     pub midi: MidiState,
     pub audio: AudioState,
     pub ui: UiState,

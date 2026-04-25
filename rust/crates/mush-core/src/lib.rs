@@ -2,6 +2,7 @@ pub mod app;
 pub mod audio;
 pub mod audio_bridge;
 pub mod camera;
+pub mod input_capture;
 pub mod commands;
 pub mod dsp;
 pub mod ports;

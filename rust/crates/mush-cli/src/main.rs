@@ -11,13 +11,17 @@ use crossterm::{
     execute, queue, style,
     terminal::{self, ClearType},
 };
+#[cfg(unix)]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use mush_core::state::{
     audio::AudioDeviceSelection,
     drums::{get_bank, DrumVoice, NUM_DRUM_BANKS},
     midi::{MidiBindingTarget, MidiChannel, MidiLearnMode},
     project::ProjectTarget,
     synth::Waveform,
-    ui::{SettingsPage, Theme, VisualFx, VisualMode},
+    ui::{SettingsPage, TabFocus, Theme, VisualFx, VisualMode},
     AppState, MAX_VOICES, NUM_PATTERNS, NUM_STEPS,
 };
 use mush_core::visuals::{Framebuffer, VisualRegistry};
@@ -40,10 +44,30 @@ fn main() -> Result<()> {
         cursor::MoveTo(0, 0),
         cursor::Hide
     )?;
+    // Kitty-style keyboard protocol: reliable Press/Repeat/Release kinds for plain keys (Unix).
+    // Without this, many terminals never emit Release, so `keyboard_note` sticks and chromatic
+    // keys stop firing sample/synth note-ons after the first press.
+    #[cfg(unix)]
+    {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        );
+        stdout.flush()?;
+    }
 
     let mut ui = UiLocalState::default();
     let result = run_app(&mut stdout, &mut runtime, &mut ui);
 
+    #[cfg(unix)]
+    {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        let _ = stdout.flush();
+    }
     terminal::disable_raw_mode()?;
     execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
     result
@@ -318,16 +342,33 @@ fn draw_overlay_mask_region(stdout: &mut Stdout, frame: &RenderedFrame, ui: &UiL
 }
 
 fn handle_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Result<bool> {
+    // Key-up uses `KeyEventKind::Release` (enable Kitty keyboard flags in `main` for plain letters).
     match key.kind {
         KeyEventKind::Release => {
             let mut state = runtime.state.lock();
             if let Some(offset) = key_to_offset(&key.code) {
-                if Some(offset) == ui.keyboard_note {
-                    state.synth.key_offset = None;
-                    state.synth.key_note_on = false;
+                let matched = Some(offset) == ui.keyboard_note;
+                if matched {
                     ui.keyboard_note = None;
                     ui.keyboard_note_started_at = None;
                     ui.keyboard_note_last_repeat_at = None;
+                    ui.keyboard_note_repeat_count = 0;
+                }
+                match state.ui.tab_focus {
+                    TabFocus::Sample => {
+                        let note = state.sample.note_for_keyboard_offset(offset);
+                        let sample_ok = state.sample.play_enabled && state.sample.has_audio();
+                        drop(state);
+                        if sample_ok {
+                            runtime.queue_sample_note_off(note);
+                        }
+                    }
+                    TabFocus::Synth | TabFocus::Drums => {
+                        if matched {
+                            state.synth.key_offset = None;
+                            state.synth.key_note_on = false;
+                        }
+                    }
                 }
             }
             return Ok(false);
@@ -340,37 +381,47 @@ fn handle_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Re
     }
 
     let mut state = runtime.state.lock();
+    if key_matches_shifted_base_letter(&key, 'h') {
+        let new_state = !state.ui.help_open;
+        state.ui.help_open = new_state;
+        if new_state {
+            state.ui.settings_open = false;
+        }
+        return Ok(false);
+    }
+    if key_matches_shifted_base_letter(&key, 's') {
+        let new_state = !state.ui.settings_open;
+        state.ui.settings_open = new_state;
+        if new_state {
+            state.ui.help_open = false;
+        }
+        return Ok(false);
+    }
     match key.code {
         KeyCode::Char('q') => return Ok(true),
-        KeyCode::Char('H') => {
-            let new_state = !state.ui.help_open;
-            state.ui.help_open = new_state;
-            if new_state {
-                state.ui.settings_open = false;
-            }
-        }
         KeyCode::Tab => {
-            ui.focus = if matches!(ui.focus, Focus::Synth) {
-                Focus::Drums
-            } else {
-                Focus::Synth
+            state.ui.tab_focus = match state.ui.tab_focus {
+                TabFocus::Synth => TabFocus::Drums,
+                TabFocus::Drums => TabFocus::Sample,
+                TabFocus::Sample => TabFocus::Synth,
             };
         }
         KeyCode::Char('G') => {
             state.audio.global_recording.recording = !state.audio.global_recording.recording;
         }
-        KeyCode::Char('S') => {
-            let new_state = !state.ui.settings_open;
-            state.ui.settings_open = new_state;
-            if new_state {
-                state.ui.help_open = false;
-            }
-        }
         _ => {
-            if matches!(ui.focus, Focus::Synth) {
-                handle_synth_key(ui, key, &mut state);
-            } else {
-                handle_drum_key(ui, key, &mut state);
+            match state.ui.tab_focus {
+                TabFocus::Synth => {
+                    drop(state);
+                    handle_synth_key(runtime, ui, key)?;
+                }
+                TabFocus::Sample => {
+                    drop(state);
+                    handle_sample_key(runtime, ui, key)?;
+                }
+                TabFocus::Drums => {
+                    handle_drum_key(ui, key, &mut state);
+                }
             }
         }
     }
@@ -380,8 +431,11 @@ fn handle_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Re
 
 fn handle_settings_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Result<()> {
     let mut state = runtime.state.lock();
+    if key.code == KeyCode::Esc || key_matches_shifted_base_letter(&key, 's') {
+        state.ui.settings_open = false;
+        return Ok(());
+    }
     match key.code {
-        KeyCode::Esc | KeyCode::Char('S') => state.ui.settings_open = false,
         KeyCode::Char('[') => {
             state.ui.settings_page = prev_page(state.ui.settings_page);
             ui.settings_cursor = 0;
@@ -412,29 +466,28 @@ fn handle_settings_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEve
     Ok(())
 }
 
-fn handle_synth_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
+fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Result<()> {
     if let Some(offset) = key_to_offset(&key.code) {
-        let is_repeat = matches!(key.kind, KeyEventKind::Repeat) && ui.keyboard_note == Some(offset);
-        let is_already_held = ui.keyboard_note == Some(offset);
-        
-        if is_repeat || is_already_held {
-            // Repeat event on same note, or Press on already-held note: just keep it alive
-            if is_repeat {
-                ui.keyboard_note_repeat_count += 1;
-            }
+        // Only swallow key-repeat bursts for the *same* held key. Do not treat a fresh `Press`
+        // as "already held" — many terminals omit `Release`, so `keyboard_note` can stay set.
+        let is_same_key_autorepeat =
+            matches!(key.kind, KeyEventKind::Repeat) && ui.keyboard_note == Some(offset);
+        if is_same_key_autorepeat {
+            ui.keyboard_note_repeat_count += 1;
             ui.keyboard_note_last_repeat_at = Some(Instant::now());
-        } else {
-            // New note (different key): trigger it
-            ui.keyboard_note = Some(offset);
-            ui.keyboard_note_repeat_count = 0;
-            ui.keyboard_note_started_at = Some(Instant::now());
-            ui.keyboard_note_last_repeat_at = Some(Instant::now());
-            state.synth.key_offset = Some(offset);
-            state.synth.key_note_on = true;
+            return Ok(());
         }
-        return;
+        ui.keyboard_note = Some(offset);
+        ui.keyboard_note_repeat_count = 0;
+        ui.keyboard_note_started_at = Some(Instant::now());
+        ui.keyboard_note_last_repeat_at = Some(Instant::now());
+        let mut state = runtime.state.lock();
+        state.synth.key_offset = Some(offset);
+        state.synth.key_note_on = true;
+        return Ok(());
     }
 
+    let mut state = runtime.state.lock();
     match key.code {
         KeyCode::Char(' ') => {
             state.synth.key_note_on = false;
@@ -444,6 +497,7 @@ fn handle_synth_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) 
             ui.keyboard_note_started_at = None;
             ui.keyboard_note_last_repeat_at = None;
             ui.keyboard_note_released_at = Some(Instant::now());
+            return Ok(());
         }
         KeyCode::Left => state.synth.base_midi = (state.synth.base_midi - 1).clamp(0, 127),
         KeyCode::Right => state.synth.base_midi = (state.synth.base_midi + 1).clamp(0, 127),
@@ -451,8 +505,8 @@ fn handle_synth_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) 
         KeyCode::Down => state.synth.volume = (state.synth.volume - 0.05).clamp(0.0, 1.0),
         KeyCode::Char('1') => state.synth.active_osc = 0,
         KeyCode::Char('2') => state.synth.active_osc = 1,
-        KeyCode::Char('z') => cycle_waveform(state, -1),
-        KeyCode::Char('x') => cycle_waveform(state, 1),
+        KeyCode::Char('z') => cycle_waveform(&mut state, -1),
+        KeyCode::Char('x') => cycle_waveform(&mut state, 1),
         KeyCode::Char('[') => state.synth.attack = (state.synth.attack - 0.005).clamp(0.001, 2.0),
         KeyCode::Char(']') => state.synth.attack = (state.synth.attack + 0.005).clamp(0.001, 2.0),
         KeyCode::Char('{') => state.synth.release = (state.synth.release - 0.005).clamp(0.0001, 4.0),
@@ -591,13 +645,155 @@ fn handle_synth_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) 
             state.drums.chain_mode = !state.drums.chain_mode;
         }
         KeyCode::Char('|') => {
-            state.drums.chain_push(state.drums.current_pattern);
+            let p = state.drums.current_pattern;
+            state.drums.chain_push(p);
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             ui.should_quit = true
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// QWERTY chromatic + arrows adjust sample root / gain; other keys reuse synth shortcuts (loop, FX, etc.).
+fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Result<()> {
+    if let Some(offset) = key_to_offset(&key.code) {
+        let is_same_key_autorepeat =
+            matches!(key.kind, KeyEventKind::Repeat) && ui.keyboard_note == Some(offset);
+        if is_same_key_autorepeat {
+            ui.keyboard_note_repeat_count += 1;
+            ui.keyboard_note_last_repeat_at = Some(Instant::now());
+            return Ok(());
+        }
+        // Same key still "down" (terminals often send extra `Press` while held). Do not retrigger;
+        // the engine loops the sample until note-off / timeout. Do not bump `last_repeat_at` here
+        // so idle timeout still sees quiet after the last real `Repeat` / initial press.
+        if ui.keyboard_note == Some(offset) {
+            return Ok(());
+        }
+        ui.keyboard_note = Some(offset);
+        ui.keyboard_note_repeat_count = 0;
+        ui.keyboard_note_started_at = Some(Instant::now());
+        ui.keyboard_note_last_repeat_at = Some(Instant::now());
+        let mut state = runtime.state.lock();
+        if state.sample.has_audio() && !state.sample.play_enabled {
+            state.sample.play_enabled = true;
+        }
+        let note = state.sample.note_for_keyboard_offset(offset);
+        let sample_ok = state.sample.play_enabled && state.sample.has_audio();
+        drop(state);
+        if sample_ok {
+            runtime.queue_sample_note_on(note, 127.0);
+        }
+        return Ok(());
+    }
+
+    let mut state = runtime.state.lock();
+    match key.code {
+        KeyCode::Char(' ') => {
+            if let Some(off) = ui.keyboard_note {
+                let note = state.sample.note_for_keyboard_offset(off);
+                let sample_ok = state.sample.play_enabled && state.sample.has_audio();
+                ui.keyboard_note = None;
+                ui.keyboard_note_repeat_count = 0;
+                ui.keyboard_note_started_at = None;
+                ui.keyboard_note_last_repeat_at = None;
+                ui.keyboard_note_released_at = Some(Instant::now());
+                drop(state);
+                if sample_ok {
+                    runtime.queue_sample_note_off(note);
+                }
+            } else {
+                ui.keyboard_note_released_at = Some(Instant::now());
+            }
+            return Ok(());
+        }
+        KeyCode::Left => {
+            state.sample.root_midi = state.sample.root_midi.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            state.sample.root_midi = (state.sample.root_midi as u16 + 1).min(127) as u8;
+        }
+        KeyCode::Up => {
+            state.sample.gain = (state.sample.gain + 0.05).clamp(0.0, 2.5);
+        }
+        KeyCode::Down => {
+            state.sample.gain = (state.sample.gain - 0.05).clamp(0.0, 2.5);
+        }
+        KeyCode::Char('I') => {
+            state.sample.performance_loop.play_gain =
+                (state.sample.performance_loop.play_gain + 0.05).clamp(0.0, 1.0);
+        }
+        KeyCode::Char('O') => {
+            state.sample.performance_loop.play_gain =
+                (state.sample.performance_loop.play_gain - 0.05).clamp(0.0, 1.0);
+        }
+        KeyCode::Char('@') => {
+            state.sample.performance_loop.trim_start =
+                (state.sample.performance_loop.trim_start + 0.02).clamp(0.0, 0.9);
+        }
+        KeyCode::Char('#') => {
+            state.sample.performance_loop.trim_start =
+                (state.sample.performance_loop.trim_start - 0.02).clamp(0.0, 0.9);
+        }
+        KeyCode::Char('$') => {
+            state.sample.performance_loop.trim_end =
+                (state.sample.performance_loop.trim_end + 0.02).clamp(0.0, 0.9);
+        }
+        KeyCode::Char('%') => {
+            state.sample.performance_loop.trim_end =
+                (state.sample.performance_loop.trim_end - 0.02).clamp(0.0, 0.9);
+        }
+        KeyCode::Char('^') => {
+            state.sample.performance_loop.playback_speed =
+                (state.sample.performance_loop.playback_speed * 1.1).clamp(0.25, 4.0);
+        }
+        KeyCode::Char('&') => {
+            state.sample.performance_loop.playback_speed =
+                (state.sample.performance_loop.playback_speed / 1.1).clamp(0.25, 4.0);
+        }
+        KeyCode::Char('R') => {
+            let recording = state.sample.performance_loop.recording;
+            drop(state);
+            if recording {
+                runtime.stop_sample_loop_recording();
+            } else {
+                runtime.start_sample_loop_recording();
+            }
+            return Ok(());
+        }
+        KeyCode::Char('T') => {
+            let overdub = state.sample.performance_loop.overdub;
+            drop(state);
+            if overdub {
+                runtime.stop_sample_loop_recording();
+            } else {
+                runtime.start_sample_loop_overdub();
+            }
+            return Ok(());
+        }
+        KeyCode::Char('Y') => {
+            drop(state);
+            runtime.undo_sample_loop();
+            return Ok(());
+        }
+        KeyCode::Char('P') => {
+            drop(state);
+            runtime.toggle_sample_loop_playback();
+            return Ok(());
+        }
+        KeyCode::Char('U') => {
+            drop(state);
+            runtime.clear_sample_loop();
+            return Ok(());
+        }
+        _ => {
+            drop(state);
+            return handle_synth_key(runtime, ui, key);
+        }
+    }
+    Ok(())
 }
 
 fn update_keyboard_note_timeout(runtime: &mut Runtime, ui: &mut UiLocalState) {
@@ -611,27 +807,77 @@ fn update_keyboard_note_timeout(runtime: &mut Runtime, ui: &mut UiLocalState) {
     
     // If we've seen repeat events for this key hold
     if ui.keyboard_note_repeat_count > 0 {
-        // Apply 150ms gap timeout to detect release
-        if last_activity.elapsed() > Duration::from_millis(150) {
+        let idle_ms = {
+            let s = runtime.state.lock();
+            if matches!(s.ui.tab_focus, TabFocus::Sample) {
+                110u64
+            } else {
+                150u64
+            }
+        };
+        if last_activity.elapsed() > Duration::from_millis(idle_ms) {
             let mut state = runtime.state.lock();
-            state.synth.key_note_on = false;
-            state.synth.key_offset = None;
-            ui.keyboard_note = None;
-            ui.keyboard_note_started_at = None;
-            ui.keyboard_note_last_repeat_at = None;
-            ui.keyboard_note_repeat_count = 0;
+            let off = ui.keyboard_note.unwrap_or(0);
+            match state.ui.tab_focus {
+                TabFocus::Sample => {
+                    let note = state.sample.note_for_keyboard_offset(off);
+                    let sample_ok = state.sample.play_enabled && state.sample.has_audio();
+                    ui.keyboard_note = None;
+                    ui.keyboard_note_started_at = None;
+                    ui.keyboard_note_last_repeat_at = None;
+                    ui.keyboard_note_repeat_count = 0;
+                    drop(state);
+                    if sample_ok {
+                        runtime.queue_sample_note_off(note);
+                    }
+                }
+                TabFocus::Synth | TabFocus::Drums => {
+                    state.synth.key_note_on = false;
+                    state.synth.key_offset = None;
+                    ui.keyboard_note = None;
+                    ui.keyboard_note_started_at = None;
+                    ui.keyboard_note_last_repeat_at = None;
+                    ui.keyboard_note_repeat_count = 0;
+                }
+            }
         }
     } else {
-        // No repeats yet. If we've been waiting longer than macOS repeat delay (~500ms),
-        // assume repeats won't come, apply timeout for release detection
-        if started_at.elapsed() > Duration::from_millis(600) && last_activity.elapsed() > Duration::from_millis(150) {
+        // No repeats yet — infer key-up after quiet (shorter in sample mode; synth keeps 600ms).
+        let (hold_ms, gap_ms) = {
+            let s = runtime.state.lock();
+            if matches!(s.ui.tab_focus, TabFocus::Sample) {
+                (320u64, 120u64)
+            } else {
+                (600u64, 150u64)
+            }
+        };
+        if started_at.elapsed() > Duration::from_millis(hold_ms)
+            && last_activity.elapsed() > Duration::from_millis(gap_ms)
+        {
             let mut state = runtime.state.lock();
-            state.synth.key_note_on = false;
-            state.synth.key_offset = None;
-            ui.keyboard_note = None;
-            ui.keyboard_note_started_at = None;
-            ui.keyboard_note_last_repeat_at = None;
-            ui.keyboard_note_repeat_count = 0;
+            let off = ui.keyboard_note.unwrap_or(0);
+            match state.ui.tab_focus {
+                TabFocus::Sample => {
+                    let note = state.sample.note_for_keyboard_offset(off);
+                    let sample_ok = state.sample.play_enabled && state.sample.has_audio();
+                    ui.keyboard_note = None;
+                    ui.keyboard_note_started_at = None;
+                    ui.keyboard_note_last_repeat_at = None;
+                    ui.keyboard_note_repeat_count = 0;
+                    drop(state);
+                    if sample_ok {
+                        runtime.queue_sample_note_off(note);
+                    }
+                }
+                TabFocus::Synth | TabFocus::Drums => {
+                    state.synth.key_note_on = false;
+                    state.synth.key_offset = None;
+                    ui.keyboard_note = None;
+                    ui.keyboard_note_started_at = None;
+                    ui.keyboard_note_last_repeat_at = None;
+                    ui.keyboard_note_repeat_count = 0;
+                }
+            }
         }
     }
 }
@@ -877,7 +1123,20 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     } else {
         "OFF"
     };
-    let loop_state = if state.looper.recording && !state.looper.overdub {
+    let loop_state = if matches!(state.ui.tab_focus, TabFocus::Sample) {
+        let lp = &state.sample.performance_loop;
+        if lp.recording && !lp.overdub {
+            "REC"
+        } else if lp.overdub {
+            "DUB"
+        } else if lp.playing {
+            "PLY"
+        } else if lp.has_audio {
+            "HLD"
+        } else {
+            "OFF"
+        }
+    } else if state.looper.recording && !state.looper.overdub {
         "REC"
     } else if state.looper.overdub {
         "DUB"
@@ -922,10 +1181,10 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(
         term_w.saturating_sub(10),
         0,
-        if matches!(ui.focus, Focus::Synth) {
-            "[SYNTH]"
-        } else {
-            "[DRUMS]"
+        match state.ui.tab_focus {
+            TabFocus::Synth => "[SYNTH]",
+            TabFocus::Drums => "[DRUMS]",
+            TabFocus::Sample => "[SAMPLE]",
         },
         UiStyle::Cursor,
     );
@@ -936,11 +1195,22 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     let right_x = left_x + left_w + 1;
     let right_w = term_w.saturating_sub(right_x + 2);  // 2 char margin on right
     let visual_width = right_w.saturating_sub(2).max(24);  // 2 for box borders (1 each side)
+    const FX_TOP: usize = 15;
+    let fx_h: usize = 9;
+    let sample_top: usize = FX_TOP + fx_h + 1;
+    let sample_h: usize = 8;
+    let song_top: usize = sample_top + sample_h + 1;
+    let song_h: usize = 5;
+    let song_bottom = song_top + song_h - 1;
     canvas.boxed_style(left_x, 2, left_w, 12, " OSC ", UiStyle::Scope);
-    canvas.boxed_style(left_x, 15, left_w, 9, " FX ", UiStyle::Scope);
-    canvas.boxed_style(left_x, 24, left_w, 5, " SONG ", UiStyle::Scope);
+    canvas.boxed_style(left_x, FX_TOP, left_w, fx_h, " FX ", UiStyle::Scope);
+    canvas.boxed_style(left_x, sample_top, left_w, sample_h, " SAMPLE ", UiStyle::Scope);
+    canvas.boxed_style(left_x, song_top, left_w, song_h, " SONG ", UiStyle::Scope);
     let drum_h = 10;
-    let drum_top = term_h.saturating_sub(drum_h).max(30);
+    let drum_top = term_h
+        .saturating_sub(drum_h)
+        .max(30)
+        .max(song_bottom.saturating_add(2));
     let footer_y = drum_top.saturating_sub(1);
     let visual_box_h = drum_top.saturating_sub(3).max(6);
     canvas.boxed_style(
@@ -1183,8 +1453,111 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(left_x + 20, 22, "Rev", UiStyle::Label);
     canvas.text_style(left_x + 24, 22, &format!("{:.2}", state.synth.fx.reverb), UiStyle::Value);
 
-    // SONG section - row 25: Pattern selector (1-8)
-    canvas.text_style(left_x + 2, 25, "PAT", UiStyle::Label);
+    // SAMPLE panel (full edit: Settings S → MAIN below Reverb)
+    let smp_inner = left_w.saturating_sub(4).max(8);
+    let rec_time = if state.sample.has_audio() {
+        let el = state.sample.effective_len();
+        let sec = el as f32 / state.sample.sample_rate.max(1) as f32;
+        format!("{:05.2}s", sec)
+    } else {
+        "00.00s".to_string()
+    };
+    let rec_fill = if state.sample.input_recording {
+        0.65
+    } else if state.sample.has_audio() {
+        (state.sample.effective_len() as f32 / (state.sample.sample_rate.max(1) as f32 * 45.0)).min(1.0)
+    } else {
+        0.0
+    };
+    let smp_bar_w = smp_inner.saturating_sub(16).clamp(4, 14);
+    let rec_row = if state.sample.input_recording {
+        format!("REC ● {:>7} {}", rec_time, bar(rec_fill, smp_bar_w))
+    } else {
+        format!(
+            "REC idle {:>7} {}",
+            rec_time,
+            bar(rec_fill, smp_bar_w)
+        )
+    };
+    canvas.text_style(
+        left_x + 2,
+        sample_top + 1,
+        &short_label(&rec_row, smp_inner),
+        if state.sample.input_recording {
+            UiStyle::Filter
+        } else {
+            UiStyle::Value
+        },
+    );
+    let ruler_w = smp_inner.saturating_sub(2).max(6);
+    canvas.text_style(
+        left_x + 2,
+        sample_top + 2,
+        &short_label(
+            &sample_trim_ruler(state.sample.trim_start, state.sample.trim_end, ruler_w),
+            smp_inner,
+        ),
+        UiStyle::Hint,
+    );
+    canvas.text_style(
+        left_x + 2,
+        sample_top + 3,
+        &short_label(
+            &format!(
+                "S {:>3}%   E {:>3}%",
+                (state.sample.trim_start * 100.0) as i32,
+                (state.sample.trim_end * 100.0) as i32,
+            ),
+            smp_inner,
+        ),
+        UiStyle::Label,
+    );
+    let smp_status = if state.sample.input_recording {
+        "recording from SOUND input…".to_string()
+    } else if !state.sample.has_audio() {
+        "no sample loaded".to_string()
+    } else {
+        format!(
+            "{}  G{:.2} Sp{:.2} {} {}",
+            note_name(state.sample.root_midi as i16),
+            state.sample.gain,
+            state.sample.speed,
+            if state.sample.play_enabled { "PLAY" } else { "MUTE" },
+            if matches!(state.ui.tab_focus, TabFocus::Sample) {
+                "◀keys"
+            } else {
+                ""
+            },
+        )
+    };
+    canvas.text_style(
+        left_x + 2,
+        sample_top + 4,
+        &short_label(&smp_status, smp_inner),
+        if state.sample.has_audio() || state.sample.input_recording {
+            UiStyle::Value
+        } else {
+            UiStyle::Hint
+        },
+    );
+    canvas.text_style(
+        left_x + 2,
+        sample_top + 5,
+        &short_label(
+            "S:MAIN  TAB:SMP  ←→:root  ↑↓:gain",
+            smp_inner,
+        ),
+        UiStyle::Hint,
+    );
+    canvas.text_style(
+        left_x + 2,
+        sample_top + 6,
+        &short_label("REC: S→MAIN; macOS: mic privacy + SOUND→Built-in if Default silent", smp_inner),
+        UiStyle::Hint,
+    );
+
+    // SONG section: pattern / chain / hints (y offsets follow `song_top`)
+    canvas.text_style(left_x + 2, song_top + 1, "PAT", UiStyle::Label);
     for p in 0..NUM_PATTERNS {
         let is_current = p == state.drums.current_pattern;
         let label = if is_current {
@@ -1194,17 +1567,17 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         };
         canvas.text_style(
             left_x + 6 + (p * 3),
-            25,
+            song_top + 1,
             &label,
             if is_current { UiStyle::Active } else { UiStyle::Value },
         );
     }
 
-    // SONG section - row 26: Chain sequence
-    canvas.text_style(left_x + 2, 26, "CHN", UiStyle::Label);
+    // SONG section - chain sequence
+    canvas.text_style(left_x + 2, song_top + 2, "CHN", UiStyle::Label);
     canvas.text_style(
         left_x + 6,
-        26,
+        song_top + 2,
         if state.drums.chain_mode { "ON " } else { "OFF" },
         if state.drums.chain_mode { UiStyle::Active } else { UiStyle::Hint },
     );
@@ -1227,15 +1600,15 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     };
     canvas.text_style(
         left_x + 10,
-        26,
+        song_top + 2,
         &short_label(&chain_str, chain_display_width),
         UiStyle::Value,
     );
 
-    // SONG section - row 27: Hints
+    // SONG section - hints
     canvas.text_style(
         left_x + 2,
-        27,
+        song_top + 3,
         &short_label("{/} pat  |add  BS rem  \\ mode", left_w.saturating_sub(4)),
         UiStyle::Hint,
     );
@@ -1373,7 +1746,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
 
     let editing_pattern = &state.drums.patterns[state.drums.current_pattern];
     for (idx, row) in editing_pattern.iter().enumerate() {
-        let row_selected = matches!(ui.focus, Focus::Drums) && idx == ui.drum_voice;
+        let row_selected = matches!(state.ui.tab_focus, TabFocus::Drums) && idx == ui.drum_voice;
         canvas.text_style(
             3,
             drum_top + 2 + idx,
@@ -1450,8 +1823,11 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     } else if state.ui.settings_open {
         "Row 1 switches page. Use [ and ] to page through tabs. ↑↓ select, ←→ change, Enter/Space run. S/Esc close."
             .to_string()
-    } else if matches!(ui.focus, Focus::Synth) {
-        "TAB=drums | R/T/Y/P/U loop | \\ chain | | add | G wav | S settings".to_string()
+    } else if matches!(state.ui.tab_focus, TabFocus::Synth) {
+        "TAB=next | R/T/Y/P/U loop | \\ chain | | add | G wav | S settings".to_string()
+    } else if matches!(state.ui.tab_focus, TabFocus::Sample) {
+        "TAB=synth | ←→ root ↑↓ gain | a..k notes | R/T/Y/P/U sample loop (not synth) | S settings"
+            .to_string()
     } else {
         "TAB=synth | ←→↑↓ move | SPC toggle | r run | {/} pattern | \\ chain | | add | BS rem | S settings"
             .to_string()
@@ -1740,12 +2116,6 @@ fn theme_header_seq(theme: Theme) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Focus {
-    Synth,
-    Drums,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrumClearConfirm {
     Row(usize),
@@ -1753,7 +2123,6 @@ enum DrumClearConfirm {
 }
 
 struct UiLocalState {
-    focus: Focus,
     drum_voice: usize,
     drum_step: usize,
     keyboard_note: Option<i8>,
@@ -1780,7 +2149,6 @@ struct UiLocalState {
 impl Default for UiLocalState {
     fn default() -> Self {
         Self {
-            focus: Focus::Synth,
             drum_voice: 0,
             drum_step: 0,
             keyboard_note: None,
@@ -1803,21 +2171,39 @@ impl Default for UiLocalState {
     }
 }
 
+/// `Shift+S` as `Char('S')` (legacy) or `Char('s')` + [`KeyModifiers::SHIFT`] (Kitty
+/// `REPORT_ALL_KEYS_AS_ESCAPE_CODES`). Plain `s` / `h` must not match.
+fn key_matches_shifted_base_letter(key: &KeyEvent, base: char) -> bool {
+    let lo = base.to_ascii_lowercase();
+    let hi = base.to_ascii_uppercase();
+    match key.code {
+        KeyCode::Char(c) if c == hi => true,
+        KeyCode::Char(c) if c == lo => key.modifiers.contains(KeyModifiers::SHIFT),
+        _ => false,
+    }
+}
+
+/// QWERTY chromatic row (A W S E D F …) — `offset` = semitones from `root` / `base_midi`.
+/// Matches **case-insensitively** so Caps Lock / uppercase key events still work.
 fn key_to_offset(code: &KeyCode) -> Option<i8> {
-    match code {
-        KeyCode::Char('a') => Some(0),
-        KeyCode::Char('w') => Some(1),
-        KeyCode::Char('s') => Some(2),
-        KeyCode::Char('e') => Some(3),
-        KeyCode::Char('d') => Some(4),
-        KeyCode::Char('f') => Some(5),
-        KeyCode::Char('t') => Some(6),
-        KeyCode::Char('g') => Some(7),
-        KeyCode::Char('y') => Some(8),
-        KeyCode::Char('h') => Some(9),
-        KeyCode::Char('u') => Some(10),
-        KeyCode::Char('j') => Some(11),
-        KeyCode::Char('k') => Some(12),
+    let ch = match code {
+        KeyCode::Char(c) if c.is_ascii_alphabetic() => c.to_ascii_lowercase(),
+        _ => return None,
+    };
+    match ch {
+        'a' => Some(0),
+        'w' => Some(1),
+        's' => Some(2),
+        'e' => Some(3),
+        'd' => Some(4),
+        'f' => Some(5),
+        't' => Some(6),
+        'g' => Some(7),
+        'y' => Some(8),
+        'h' => Some(9),
+        'u' => Some(10),
+        'j' => Some(11),
+        'k' => Some(12),
         _ => None,
     }
 }
@@ -1924,7 +2310,7 @@ fn next_project_name(existing: &[ProjectTarget]) -> String {
 
 fn settings_row_count(page: SettingsPage, visual_mode: VisualMode) -> usize {
     match page {
-        SettingsPage::Main => 11,
+        SettingsPage::Main => 22,
         SettingsPage::Visuals => match visual_mode {
             VisualMode::Scope => 2,   // Visual + Drums scope
             _ => 3,                   // Visual + FX Style + FX Depth (all framebuffer visuals)
@@ -2029,6 +2415,10 @@ fn draw_help_overlay(canvas: &mut Canvas, x: usize, y: usize, width: usize, heig
                     "Drive, delay, feedback, time.",
                 ),
                 ("[W] [A] [E]", "Warmth, air, reverb."),
+                (
+                    "[S] MAIN ↓ past Rev",
+                    "Sample: record from SOUND-tab input, trim, keys+MIDI when Play ON.",
+                ),
             ],
         ),
         (
@@ -2049,7 +2439,7 @@ fn draw_help_overlay(canvas: &mut Canvas, x: usize, y: usize, width: usize, heig
                 ),
                 ("[U]", "Clear: erase entire loop, return to idle."),
                 ("[G]", "Global mix record to WAV."),
-                ("[TAB]", "Switch synth/drum focus."),
+                ("[TAB]", "Cycle focus: synth → drums → sample (notes/MIDI target)."),
                 (
                     "[←] [→] [↑] [↓]",
                     "Move around the drum grid.",
@@ -2200,6 +2590,49 @@ fn settings_lines(state: &AppState, ui: &UiLocalState) -> Vec<String> {
             selected(8, format!("Warmth     {:.2}", state.synth.fx.warmth)),
             selected(9, format!("Air        {:.2}", state.synth.fx.air)),
             selected(10, format!("Reverb     {:.2}", state.synth.fx.reverb)),
+            selected(
+                11,
+                format!(
+                    "Smp REC    {}  [ENTER]",
+                    if state.sample.input_recording {
+                        "●REC"
+                    } else {
+                        "idle"
+                    }
+                ),
+            ),
+            selected(12, "Smp CLEAR  [ENTER]".to_string()),
+            selected(
+                13,
+                format!("Smp trim0  {:.0}%", state.sample.trim_start * 100.0),
+            ),
+            selected(
+                14,
+                format!("Smp trim1  {:.0}%", state.sample.trim_end * 100.0),
+            ),
+            selected(15, format!("Smp gain   {:.2}", state.sample.gain)),
+            selected(16, format!("Smp speed  {:.2}", state.sample.speed)),
+            selected(
+                17,
+                format!("Smp pitch  {:+.1} st", state.sample.pitch_semitones),
+            ),
+            selected(
+                18,
+                format!(
+                    "Smp root   {} ({})",
+                    note_name(state.sample.root_midi as i16),
+                    state.sample.root_midi
+                ),
+            ),
+            selected(19, format!("Smp atk    {:.3}s", state.sample.attack)),
+            selected(20, format!("Smp rel    {:.3}s", state.sample.release)),
+            selected(
+                21,
+                format!(
+                    "Smp play   {}",
+                    if state.sample.play_enabled { "ON " } else { "OFF" }
+                ),
+            ),
         ],
         SettingsPage::Visuals => {
             let mut rows = vec![selected(0, format!("Visual     {}", state.ui.visual_mode.name()))];
@@ -2378,6 +2811,44 @@ fn adjust_setting(runtime: &mut Runtime, ui: &mut UiLocalState, delta: i32) -> R
                 state.synth.fx.reverb =
                     (state.synth.fx.reverb + delta as f32 * 0.05).clamp(0.0, 1.0)
             }
+            11 | 12 => {}
+            13 => {
+                state.sample.trim_start =
+                    (state.sample.trim_start + delta as f32 * 0.01).clamp(0.0, 0.9);
+            }
+            14 => {
+                state.sample.trim_end =
+                    (state.sample.trim_end + delta as f32 * 0.01).clamp(0.0, 0.9);
+            }
+            15 => {
+                state.sample.gain = (state.sample.gain + delta as f32 * 0.04).clamp(0.0, 2.5);
+            }
+            16 => {
+                state.sample.speed = (state.sample.speed + delta as f32 * 0.05).clamp(0.05, 8.0);
+            }
+            17 => {
+                state.sample.pitch_semitones =
+                    (state.sample.pitch_semitones + delta as f32 * 0.5).clamp(-24.0, 24.0);
+            }
+            18 => {
+                state.sample.root_midi =
+                    ((state.sample.root_midi as i32 + delta).clamp(0, 127)) as u8;
+            }
+            19 => {
+                state.sample.attack =
+                    (state.sample.attack + delta as f32 * 0.002).clamp(0.0005, 1.5);
+            }
+            20 => {
+                state.sample.release =
+                    (state.sample.release + delta as f32 * 0.005).clamp(0.005, 3.0);
+            }
+            21 => {
+                if delta < 0 {
+                    state.sample.play_enabled = false;
+                } else if delta > 0 {
+                    state.sample.play_enabled = true;
+                }
+            }
             _ => {}
         },
         SettingsPage::Visuals => match ui.settings_cursor {
@@ -2467,6 +2938,20 @@ fn adjust_setting(runtime: &mut Runtime, ui: &mut UiLocalState, delta: i32) -> R
 fn activate_setting(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<()> {
     let page = runtime.state.lock().ui.settings_page;
     match page {
+        SettingsPage::Main => match ui.settings_cursor {
+            11 => {
+                let recording = runtime.state.lock().sample.input_recording;
+                if recording {
+                    runtime.end_sample_input_record();
+                } else if let Err(e) = runtime.begin_sample_input_record() {
+                    runtime.state.lock().audio.status = format!("Sample in: {e}");
+                }
+            }
+            12 => {
+                runtime.state.lock().sample.clear_buffer();
+            }
+            _ => {}
+        },
         SettingsPage::Project => match ui.settings_cursor {
             1 => {
                 let target = {
@@ -2670,6 +3155,26 @@ fn bar(value: f32, width: usize) -> String {
     let width = width.max(1);
     let filled = ((value.clamp(0.0, 1.0) * width as f32).round() as usize).min(width);
     format!("{}{}", "▓".repeat(filled), "░".repeat(width - filled))
+}
+
+/// `[----S------E--]` ruler: `trim_start` / `trim_end` are fractions of buffer (same as engine).
+fn sample_trim_ruler(trim_start: f32, trim_end: f32, bar_inner: usize) -> String {
+    let w = bar_inner.max(6);
+    let mut bytes = vec![b'-'; w];
+    let max_ix = w.saturating_sub(1).max(1);
+    let s_ix = (trim_start.clamp(0.0, 0.95) * max_ix as f32).round() as usize;
+    let s_ix = s_ix.min(max_ix);
+    let e_ix = ((1.0 - trim_end.clamp(0.0, 0.95)) * max_ix as f32)
+        .round()
+        .clamp(s_ix as f32, max_ix as f32) as usize;
+    if s_ix >= e_ix {
+        bytes[s_ix] = b'|';
+    } else {
+        bytes[s_ix] = b'S';
+        bytes[e_ix] = b'E';
+    }
+    let body: String = bytes.iter().map(|&b| b as char).collect();
+    format!("[{body}]")
 }
 
 fn render_scope_braille(samples: &[f32], width: usize, height: usize) -> Vec<String> {

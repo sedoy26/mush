@@ -94,6 +94,48 @@ pub fn loop_wav_path(base_dir: &Path, project_name: &str) -> PathBuf {
     projects_dir(base_dir).join(loop_name)
 }
 
+/// Mono sample captured from line-in (sidecar for `.mush` project).
+pub fn sample_wav_path(base_dir: &Path, project_name: &str) -> PathBuf {
+    let file_name = normalize_project_name(project_name);
+    let name = file_name.replace(".mush", ".sample.wav");
+    projects_dir(base_dir).join(name)
+}
+
+/// Mono buffer for sample-tab performance loop (chromatic take layer).
+pub fn sample_loop_wav_path(base_dir: &Path, project_name: &str) -> PathBuf {
+    let file_name = normalize_project_name(project_name);
+    let name = file_name.replace(".mush", ".sampleloop.wav");
+    projects_dir(base_dir).join(name)
+}
+
+pub fn save_sample_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
+    save_loop_wav(path, samples, sample_rate)
+}
+
+pub fn load_sample_wav(path: &Path) -> Result<(Vec<f32>, usize, u32)> {
+    let mut reader = hound::WavReader::open(path).context("open sample wav")?;
+    let spec = reader.spec();
+    let rate = spec.sample_rate;
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+        hound::SampleFormat::Int => match spec.bits_per_sample {
+            16 => reader
+                .samples::<i16>()
+                .filter_map(|s| s.ok())
+                .map(|s| s as f32 / i16::MAX as f32)
+                .collect(),
+            24 | 32 => reader
+                .samples::<i32>()
+                .filter_map(|s| s.ok())
+                .map(|s| s as f32 / i32::MAX as f32)
+                .collect(),
+            _ => anyhow::bail!("unsupported bit depth: {}", spec.bits_per_sample),
+        },
+    };
+    let len = samples.len();
+    Ok((samples, len, rate))
+}
+
 /// Save loop audio samples to WAV file.
 pub fn save_loop_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     let spec = hound::WavSpec {

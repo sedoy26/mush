@@ -20,6 +20,7 @@ use arc_swap::ArcSwap;
 use crate::state::{
     drums::DrumState,
     looper::LoopState,
+    sample::SampleState,
     synth::SynthState,
 };
 
@@ -31,6 +32,63 @@ pub struct AudioParams {
     pub drums: DrumState,
     pub looper: LooperParams,
     pub global_recording: bool,
+    pub sample: SampleParams,
+}
+
+/// Snapshot for chromatic sample playback (cheap `Arc` clone each frame).
+#[derive(Clone, Debug)]
+pub struct SampleParams {
+    pub buffer: Arc<Vec<f32>>,
+    pub sample_rate: u32,
+    pub trim_start: f32,
+    pub trim_end: f32,
+    pub gain: f32,
+    pub speed: f32,
+    pub pitch_semitones: f32,
+    pub root_midi: u8,
+    pub attack: f32,
+    pub release: f32,
+    pub play_enabled: bool,
+    /// Sample-tab performance loop (same fields as main looper; separate buffer on audio thread).
+    pub sample_loop: LooperParams,
+}
+
+impl Default for SampleParams {
+    fn default() -> Self {
+        Self {
+            buffer: Arc::new(Vec::new()),
+            sample_rate: 48_000,
+            trim_start: 0.0,
+            trim_end: 0.0,
+            gain: 1.0,
+            speed: 1.0,
+            pitch_semitones: 0.0,
+            root_midi: 60,
+            attack: 0.003,
+            release: 0.08,
+            play_enabled: true,
+            sample_loop: LooperParams::default(),
+        }
+    }
+}
+
+impl From<&SampleState> for SampleParams {
+    fn from(s: &SampleState) -> Self {
+        Self {
+            buffer: Arc::clone(&s.buffer),
+            sample_rate: s.sample_rate,
+            trim_start: s.trim_start,
+            trim_end: s.trim_end,
+            gain: s.gain,
+            speed: s.speed,
+            pitch_semitones: s.pitch_semitones,
+            root_midi: s.root_midi,
+            attack: s.attack,
+            release: s.release,
+            play_enabled: s.play_enabled,
+            sample_loop: LooperParams::from(&s.performance_loop),
+        }
+    }
 }
 
 /// Subset of looper state the audio thread needs.
@@ -68,6 +126,7 @@ impl Default for AudioParams {
             drums: DrumState::default(),
             looper: LooperParams::default(),
             global_recording: false,
+            sample: SampleParams::default(),
         }
     }
 }
@@ -95,6 +154,22 @@ pub enum AudioCommand {
     SetLoopSpeed(f32),
     /// Trigger a drum voice
     TriggerDrum(usize),
+    /// Chromatic sample: note on (polyphonic). `sample_snapshot` applies on the audio thread before
+    /// arming the voice so playback never races an empty `ArcSwap` snapshot.
+    SampleNoteOn {
+        note: u8,
+        velocity: f32,
+        sample_snapshot: Option<SampleParams>,
+    },
+    /// Chromatic sample: note off
+    SampleNoteOff { note: u8 },
+    /// Sample performance loop (see `SampleState::performance_loop`)
+    SampleStartRecording,
+    SampleStartOverdub,
+    SampleStopRecording,
+    SampleSetPlaying(bool),
+    SampleClearLoop,
+    SampleRestoreLoop { length: usize },
 }
 
 /// Atomic wrapper for f32 values.
@@ -140,6 +215,10 @@ pub struct ReactiveState {
     pub loop_read_pos: AtomicU64,
     pub loop_write_pos: AtomicU64,
     pub loop_has_audio: AtomicU32, // bool as u32
+    pub sample_loop_length: AtomicU64,
+    pub sample_loop_read_pos: AtomicU64,
+    pub sample_loop_write_pos: AtomicU64,
+    pub sample_loop_has_audio: AtomicU32,
     pub xruns: AtomicU64,
     // Drum sequencer state
     pub drum_step: AtomicU32,
@@ -288,7 +367,8 @@ impl ScopeBufferPool {
 /// These should NOT be wrapped in mutex - producer is owned by UI thread,
 /// consumer is moved into audio callback closure.
 pub fn create_command_channel() -> (rtrb::Producer<AudioCommand>, rtrb::Consumer<AudioCommand>) {
-    rtrb::RingBuffer::new(256)
+    // Large enough for bursts (MIDI + UI) without dropping note/loop commands under load.
+    rtrb::RingBuffer::new(4096)
 }
 
 impl AudioBridge {
@@ -301,12 +381,20 @@ impl AudioBridge {
     }
 
     /// UI thread: Update params snapshot.
-    pub fn update_params(&self, synth: &SynthState, drums: &DrumState, looper: &LoopState, global_recording: bool) {
+    pub fn update_params(
+        &self,
+        synth: &SynthState,
+        drums: &DrumState,
+        looper: &LoopState,
+        global_recording: bool,
+        sample: &SampleState,
+    ) {
         let new_params = AudioParams {
             synth: synth.clone(),
             drums: drums.clone(),
             looper: LooperParams::from(looper),
             global_recording,
+            sample: SampleParams::from(sample),
         };
         self.params.store(Arc::new(new_params));
     }
@@ -348,6 +436,15 @@ impl AudioBridge {
         state.looper.read_pos = self.reactive.loop_read_pos.load(Ordering::Relaxed) as usize;
         state.looper.write_pos = self.reactive.loop_write_pos.load(Ordering::Relaxed) as usize;
         state.looper.has_audio = self.reactive.loop_has_audio.load(Ordering::Relaxed) != 0;
+
+        state.sample.performance_loop.length =
+            self.reactive.sample_loop_length.load(Ordering::Relaxed) as usize;
+        state.sample.performance_loop.read_pos =
+            self.reactive.sample_loop_read_pos.load(Ordering::Relaxed) as usize;
+        state.sample.performance_loop.write_pos =
+            self.reactive.sample_loop_write_pos.load(Ordering::Relaxed) as usize;
+        state.sample.performance_loop.has_audio =
+            self.reactive.sample_loop_has_audio.load(Ordering::Relaxed) != 0;
 
         // Drum sequencer step position (for UI cursor display)
         state.drums.current_step = self.reactive.drum_step.load(Ordering::Relaxed) as usize;

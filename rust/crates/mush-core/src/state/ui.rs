@@ -220,6 +220,15 @@ pub enum SettingsPage {
     Midi,
 }
 
+/// Which performance layer receives QWERTY note keys and MIDI note-on/off (TAB cycles).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TabFocus {
+    #[default]
+    Synth,
+    Drums,
+    Sample,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiState {
@@ -236,6 +245,8 @@ pub struct UiState {
     #[serde(alias = "camera_reactivity")]
     pub visual_fx_depth: f32,
     pub scope_show_drums: bool,
+    #[serde(default)]
+    pub tab_focus: TabFocus,
 }
 
 impl Default for UiState {
@@ -249,6 +260,7 @@ impl Default for UiState {
             visual_fx: VisualFx::Off,
             visual_fx_depth: 0.85,
             scope_show_drums: true,
+            tab_focus: TabFocus::default(),
         }
     }
 }

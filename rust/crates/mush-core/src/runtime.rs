@@ -9,13 +9,15 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
+use crossbeam_queue::SegQueue;
 use cpal::traits::{DeviceTrait, HostTrait};
 use parking_lot::Mutex;
 
 use crate::{
-    audio_bridge::{AudioBridge, AudioCommand, create_command_channel},
     audio::{AudioRuntime, SharedAudio},
+    audio_bridge::{AudioBridge, AudioCommand, SampleParams, create_command_channel},
     camera::CameraRuntime,
+    input_capture::InputCapture,
     project_io,
     state::{audio::AudioDeviceInfo, midi::MidiDeviceInfo, AppState},
 };
@@ -30,6 +32,9 @@ pub struct Runtime {
     command_tx: Mutex<Option<rtrb::Producer<AudioCommand>>>,
     /// Command queue consumer (moved to audio on start)
     command_rx: Mutex<Option<rtrb::Consumer<AudioCommand>>>,
+    /// MIDI thread pushes sample note commands; audio callback drains (lock-free queue).
+    midi_sample_cmds: Arc<SegQueue<AudioCommand>>,
+    input_capture: Mutex<Option<InputCapture>>,
     base_dir: PathBuf,
     audio: SharedAudio,
     audio_runtime: Option<AudioRuntime>,
@@ -50,6 +55,8 @@ impl Runtime {
             bridge,
             command_tx: Mutex::new(Some(command_tx)),
             command_rx: Mutex::new(Some(command_rx)),
+            midi_sample_cmds: Arc::new(SegQueue::new()),
+            input_capture: Mutex::new(None),
             base_dir,
             audio,
             audio_runtime: None,
@@ -74,11 +81,13 @@ impl Runtime {
                 &state.drums,
                 &state.looper,
                 state.audio.global_recording.recording,
+                &state.sample,
             );
             state.audio.output.clone()
         };
-        
-        self.audio_runtime = Some(self.audio.start(&selection, command_rx)?);
+
+        let midi_q = Some(Arc::clone(&self.midi_sample_cmds));
+        self.audio_runtime = Some(self.audio.start(&selection, command_rx, midi_q)?);
         
         let mut state = self.state.lock();
         state.audio.status = "Audio active".to_string();
@@ -97,8 +106,11 @@ impl Runtime {
     /// Send a command to the audio thread (lock-free push to SPSC queue).
     fn send_command(&self, cmd: AudioCommand) {
         if let Some(ref mut tx) = *self.command_tx.lock() {
-            // Try to push - if queue is full, command is dropped (rare)
-            let _ = tx.push(cmd);
+            if let Err(_full) = tx.push(cmd) {
+                let mut s = self.state.lock();
+                s.audio.status =
+                    "Audio command queue full — wait a moment and try again".to_string();
+            }
         }
     }
 
@@ -113,11 +125,13 @@ impl Runtime {
                 &state.drums,
                 &state.looper,
                 state.audio.global_recording.recording,
+                &state.sample,
             );
             // Reset clear_requested after sending so it's only active for one sync cycle
             state.looper.clear_requested = false;
+            state.sample.performance_loop.clear_requested = false;
         }
-        
+
         // 2. Pull reactive state from audio (lock-free reads)
         {
             let mut state = self.state.lock();
@@ -128,6 +142,98 @@ impl Runtime {
     /// Send a loop command to audio thread (lock-free SPSC push).
     pub fn send_loop_command(&self, cmd: AudioCommand) {
         self.send_command(cmd);
+    }
+
+    /// Keyboard-driven sample notes use the same lock-free SPSC queue as loop/drum commands so
+    /// they are never skipped (the old MIDI overflow path used `try_lock` and could drop events).
+    pub fn queue_sample_note_on(&self, note: u8, velocity: f32) {
+        let sample_snapshot = {
+            let s = self.state.lock();
+            SampleParams::from(&s.sample)
+        };
+        self.push_audio_params();
+        self.send_command(AudioCommand::SampleNoteOn {
+            note,
+            velocity,
+            sample_snapshot: Some(sample_snapshot),
+        });
+    }
+
+    pub fn queue_sample_note_off(&self, note: u8) {
+        self.push_audio_params();
+        self.send_command(AudioCommand::SampleNoteOff { note });
+    }
+
+    /// Push current `AppState` snapshot to the audio thread (same as `sync_audio` step 1).
+    fn push_audio_params(&self) {
+        let state = self.state.lock();
+        self.bridge.update_params(
+            &state.synth,
+            &state.drums,
+            &state.looper,
+            state.audio.global_recording.recording,
+            &state.sample,
+        );
+    }
+
+    /// Start CPAL input capture (uses `AppState.audio.input`). Call `end_sample_input_record` to commit.
+    pub fn begin_sample_input_record(&mut self) -> Result<()> {
+        *self.input_capture.lock() = None;
+        let (selection, hint) = {
+            let s = self.state.lock();
+            (s.audio.input.clone(), 48_000.0f32)
+        };
+        let cap = InputCapture::start(&selection, hint).with_context(|| {
+            "input open failed — on macOS allow Microphone for this app in System Settings → Privacy & Security; in mush SOUND page pick your built-in mic if Default is silent"
+        })?;
+        cap.set_recording(true);
+        *self.input_capture.lock() = Some(cap);
+        self.state.lock().sample.input_recording = true;
+        Ok(())
+    }
+
+    /// Stop input stream and copy captured audio into `AppState.sample`.
+    pub fn end_sample_input_record(&mut self) {
+        let taken = self.input_capture.lock().take();
+        let mut state = self.state.lock();
+        state.sample.input_recording = false;
+        if let Some(cap) = taken {
+            let (buf, rate) = cap.stop_and_take();
+            // Match audio engine: need ≥2 samples for interpolation; do not use the old 64-sample
+            // commit gate or short takes never reach playback.
+            if buf.len() >= 2 {
+                let peak0 = buf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let mut buf = buf;
+                if peak0 > 1e-12 && peak0 < 0.04 {
+                    let scale = (0.28_f32 / peak0).min(80.0);
+                    for x in &mut buf {
+                        *x *= scale;
+                    }
+                }
+                let peak = buf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let secs = buf.len() as f32 / rate.max(1) as f32;
+                state.sample.set_buffer(buf, rate);
+                state.sample.play_enabled = true;
+                if peak < 0.0025 {
+                    state.audio.status = format!(
+                        "Sample captured {:.2}s (still very quiet peak {:.4} — check input gain)",
+                        secs, peak
+                    );
+                } else {
+                    state.audio.status =
+                        format!("Sample captured {:.2}s (peak {:.3})", secs, peak);
+                }
+            } else {
+                state.audio.status = "Sample capture too short — hold REC longer".to_string();
+            }
+        }
+        self.bridge.update_params(
+            &state.synth,
+            &state.drums,
+            &state.looper,
+            state.audio.global_recording.recording,
+            &state.sample,
+        );
     }
 
     /// Start recording a new loop (replace existing).
@@ -195,6 +301,50 @@ impl Runtime {
                 state.looper.play_gain = 0.7;
             }
             self.send_command(AudioCommand::RestoreLoop { length: snapshot.length });
+        }
+    }
+
+    pub fn start_sample_loop_recording(&self) {
+        let mut state = self.state.lock();
+        state.sample.performance_loop.begin_replace();
+        self.send_command(AudioCommand::SampleStartRecording);
+    }
+
+    pub fn start_sample_loop_overdub(&self) {
+        let mut state = self.state.lock();
+        if state.sample.performance_loop.has_audio {
+            state.sample.performance_loop.begin_overdub();
+            self.send_command(AudioCommand::SampleStartOverdub);
+        }
+    }
+
+    pub fn stop_sample_loop_recording(&self) {
+        let mut state = self.state.lock();
+        state.sample.performance_loop.stop_recording();
+        self.send_command(AudioCommand::SampleStopRecording);
+    }
+
+    pub fn toggle_sample_loop_playback(&self) {
+        let mut state = self.state.lock();
+        if state.sample.performance_loop.has_audio {
+            state.sample.performance_loop.playing = !state.sample.performance_loop.playing;
+            let p = state.sample.performance_loop.playing;
+            self.send_command(AudioCommand::SampleSetPlaying(p));
+        }
+    }
+
+    pub fn clear_sample_loop(&self) {
+        let mut state = self.state.lock();
+        state.sample.performance_loop.clear();
+        self.send_command(AudioCommand::SampleClearLoop);
+    }
+
+    pub fn undo_sample_loop(&self) {
+        let mut state = self.state.lock();
+        if state.sample.performance_loop.undo_last() {
+            let length = state.sample.performance_loop.length;
+            drop(state);
+            self.send_command(AudioCommand::SampleRestoreLoop { length });
         }
     }
 
@@ -271,10 +421,12 @@ impl Runtime {
         let port = maybe_port.context("no MIDI input port available")?;
         let port_name = midi.port_name(&port).unwrap_or_else(|_| "MIDI".to_string());
         let state = Arc::clone(&self.state);
+        let midi_q = Arc::clone(&self.midi_sample_cmds);
+        let bridge = Arc::clone(&self.bridge);
         let conn = midi.connect(
             &port,
             "mush-midi-input",
-            move |_stamp, message, _| on_midi_message(&state, message),
+            move |_stamp, message, _| on_midi_message(&state, &bridge, &midi_q, message),
             (),
         )?;
 
@@ -316,7 +468,42 @@ impl Runtime {
             let loop_path = project_io::loop_wav_path(&self.base_dir, name);
             let _ = std::fs::remove_file(loop_path); // Ignore errors
         }
-        
+
+        let sample_path = project_io::sample_wav_path(&self.base_dir, name);
+        if state.sample.has_audio() {
+            project_io::save_sample_wav(
+                &sample_path,
+                state.sample.buffer.as_ref(),
+                state.sample.sample_rate,
+            )?;
+        } else {
+            let _ = std::fs::remove_file(sample_path);
+        }
+
+        if let Some((samples, length, sample_rate)) = self.audio.export_sample_loop() {
+            let path = project_io::sample_loop_wav_path(&self.base_dir, name);
+            project_io::save_loop_wav(&path, &samples[..length], sample_rate)?;
+            state.sample.performance_loop.length = length;
+            state.sample.performance_loop.has_audio = true;
+            state.sample.performance_loop.playing = false;
+            state.sample.performance_loop.recording = false;
+            state.sample.performance_loop.overdub = false;
+            state.sample.performance_loop.read_pos = 0;
+            state.sample.performance_loop.write_pos = length;
+            state.sample.performance_loop.undo_stack.clear();
+        } else {
+            state.sample.performance_loop.length = 0;
+            state.sample.performance_loop.write_pos = 0;
+            state.sample.performance_loop.read_pos = 0;
+            state.sample.performance_loop.recording = false;
+            state.sample.performance_loop.playing = false;
+            state.sample.performance_loop.overdub = false;
+            state.sample.performance_loop.has_audio = false;
+            state.sample.performance_loop.undo_stack.clear();
+            let path = project_io::sample_loop_wav_path(&self.base_dir, name);
+            let _ = std::fs::remove_file(path);
+        }
+
         project_io::save_project(&self.base_dir, name, &state)
     }
 
@@ -364,7 +551,57 @@ impl Runtime {
             loaded.looper.has_audio = false;
         }
         loaded.looper.undo_stack.clear();
-        
+
+        let sample_path = project_io::sample_wav_path(&self.base_dir, name);
+        if sample_path.exists() {
+            match project_io::load_sample_wav(&sample_path) {
+                Ok((samples, len, rate)) => {
+                    let n = len.min(samples.len());
+                    loaded.sample.set_buffer(samples[..n].to_vec(), rate);
+                }
+                Err(_) => loaded.sample.clear_buffer(),
+            }
+        } else {
+            loaded.sample.clear_buffer();
+        }
+
+        let sample_loop_path = project_io::sample_loop_wav_path(&self.base_dir, name);
+        if sample_loop_path.exists() {
+            match project_io::load_loop_wav(&sample_loop_path) {
+                Ok((samples, length)) => {
+                    self.audio.import_sample_loop(&samples, length);
+                    loaded.sample.performance_loop.length = length;
+                    loaded.sample.performance_loop.has_audio = length > 0;
+                    loaded.sample.performance_loop.playing = false;
+                    loaded.sample.performance_loop.recording = false;
+                    loaded.sample.performance_loop.overdub = false;
+                    loaded.sample.performance_loop.read_pos = 0;
+                    loaded.sample.performance_loop.write_pos = length;
+                    if loaded.sample.performance_loop.play_gain < 0.1 {
+                        loaded.sample.performance_loop.play_gain = 0.7;
+                    }
+                }
+                Err(_) => {
+                    loaded.sample.performance_loop.length = 0;
+                    loaded.sample.performance_loop.write_pos = 0;
+                    loaded.sample.performance_loop.read_pos = 0;
+                    loaded.sample.performance_loop.recording = false;
+                    loaded.sample.performance_loop.playing = false;
+                    loaded.sample.performance_loop.overdub = false;
+                    loaded.sample.performance_loop.has_audio = false;
+                }
+            }
+        } else {
+            loaded.sample.performance_loop.length = 0;
+            loaded.sample.performance_loop.write_pos = 0;
+            loaded.sample.performance_loop.read_pos = 0;
+            loaded.sample.performance_loop.recording = false;
+            loaded.sample.performance_loop.playing = false;
+            loaded.sample.performance_loop.overdub = false;
+            loaded.sample.performance_loop.has_audio = false;
+        }
+        loaded.sample.performance_loop.undo_stack.clear();
+
         *self.state.lock() = loaded;
         Ok(())
     }
@@ -405,7 +642,12 @@ impl Runtime {
     }
 }
 
-fn on_midi_message(state: &Arc<Mutex<AppState>>, message: &[u8]) {
+fn on_midi_message(
+    state: &Arc<Mutex<AppState>>,
+    bridge: &Arc<AudioBridge>,
+    midi_cmds: &Arc<SegQueue<AudioCommand>>,
+    message: &[u8],
+) {
     if message.is_empty() {
         return;
     }
@@ -491,15 +733,60 @@ fn on_midi_message(state: &Arc<Mutex<AppState>>, message: &[u8]) {
             }
 
             if state.midi.note_input {
+                let mapped = state.midi.note_map.get(&data1).copied().unwrap_or(data1);
                 state.midi.push_held(data1);
-                state.synth.midi_note = state.midi.active_note();
-                state.synth.midi_note_on = state.synth.midi_note.is_some();
+                match state.ui.tab_focus {
+                    crate::state::ui::TabFocus::Sample => {
+                        if state.sample.play_enabled && state.sample.has_audio() {
+                            bridge.update_params(
+                                &state.synth,
+                                &state.drums,
+                                &state.looper,
+                                state.audio.global_recording.recording,
+                                &state.sample,
+                            );
+                            let snap = SampleParams::from(&state.sample);
+                            midi_cmds.push(AudioCommand::SampleNoteOn {
+                                note: mapped,
+                                velocity: data2 as f32,
+                                sample_snapshot: Some(snap),
+                            });
+                        }
+                    }
+                    crate::state::ui::TabFocus::Synth | crate::state::ui::TabFocus::Drums => {
+                        state.synth.midi_note = state.midi.active_note();
+                        state.synth.midi_note_on = state.synth.midi_note.is_some();
+                    }
+                }
             }
         }
         0x80 | 0x90 => {
+            let mapped = state.midi.note_map.get(&data1).copied().unwrap_or(data1);
+            if state.midi.note_input {
+                match state.ui.tab_focus {
+                    crate::state::ui::TabFocus::Sample => {
+                        if state.sample.play_enabled && state.sample.has_audio() {
+                            bridge.update_params(
+                                &state.synth,
+                                &state.drums,
+                                &state.looper,
+                                state.audio.global_recording.recording,
+                                &state.sample,
+                            );
+                            midi_cmds.push(AudioCommand::SampleNoteOff { note: mapped });
+                        }
+                    }
+                    _ => {}
+                }
+            }
             state.midi.release_held(data1);
-            state.synth.midi_note = state.midi.active_note();
-            state.synth.midi_note_on = state.synth.midi_note.is_some();
+            match state.ui.tab_focus {
+                crate::state::ui::TabFocus::Synth | crate::state::ui::TabFocus::Drums => {
+                    state.synth.midi_note = state.midi.active_note();
+                    state.synth.midi_note_on = state.synth.midi_note.is_some();
+                }
+                crate::state::ui::TabFocus::Sample => {}
+            }
         }
         0xB0 => {
             if matches!(

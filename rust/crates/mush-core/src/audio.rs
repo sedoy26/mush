@@ -13,14 +13,20 @@
 //! This is non-blocking (audio callback never waits) but not strictly lock-free.
 //! Brief audio glitches (silence) may occur during project save/load.
 
-use std::{collections::VecDeque, f32::consts::PI, path::Path, sync::Arc};
+use std::{
+    collections::VecDeque,
+    f32::consts::PI,
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
+use crossbeam_queue::SegQueue;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 
 use crate::{
-    audio_bridge::{AudioBridge, AudioCommand},
+    audio_bridge::{AudioBridge, AudioCommand, SampleParams},
     dsp::{self, SmoothEnvelope, SimpleReverb, DENORMAL_PREVENTION, MAX_FEEDBACK},
     project_io,
     state::{
@@ -37,6 +43,7 @@ const LIMIT_CEILING: f32 = 0.85;   // More aggressive ceiling
 const LIMIT_DRIVE: f32 = 2.0;      // Stronger saturation curve
 const OUTPUT_GAIN: f32 = 0.35;     // Reduced master output
 const SYNTH_BUS_GAIN: f32 = 0.55;  // Reduced synth
+const SAMPLE_BUS_GAIN: f32 = 0.55; // Sample bus independent from synth volume knob
 const DRUM_BUS_GAIN: f32 = 0.28;   // Drums post-synth-FX; bus still soft-limited
 const DRUM_VOICE_GAIN: f32 = 0.40; // Per-voice trim; kick multiplies by KICK_VOICE_GAIN_MUL
 const KICK_VOICE_GAIN_MUL: f32 = 1.52; // Extra fader path for kick vs other voices
@@ -70,7 +77,12 @@ impl SharedAudio {
         }
     }
 
-    pub fn start(&self, selection: &AudioDeviceSelection, command_rx: rtrb::Consumer<AudioCommand>) -> Result<AudioRuntime> {
+    pub fn start(
+        &self,
+        selection: &AudioDeviceSelection,
+        command_rx: rtrb::Consumer<AudioCommand>,
+        midi_sample_q: Option<Arc<SegQueue<AudioCommand>>>,
+    ) -> Result<AudioRuntime> {
         let host = cpal::default_host();
         let device = select_output_device(&host, selection)?;
         let config = device.default_output_config().context("output config")?;
@@ -106,13 +118,14 @@ impl SharedAudio {
         let bridge = Arc::clone(&self.bridge);
         let engine = Arc::clone(&self.engine);
         let command_rx_f32 = Arc::clone(&command_rx);
-        
+        let midi_f32 = midi_sample_q.clone();
+
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_output_stream(
                 &stream_config,
                 move |data: &mut [f32], _| {
                     let mut rx = command_rx_f32.lock();
-                    render_callback(data, &bridge, &engine, &mut rx);
+                    render_callback(data, &bridge, &engine, &mut rx, &midi_f32);
                 },
                 err_fn,
                 None,
@@ -121,11 +134,12 @@ impl SharedAudio {
                 let bridge = Arc::clone(&self.bridge);
                 let engine = Arc::clone(&self.engine);
                 let command_rx_i16 = Arc::clone(&command_rx);
+                let midi_i16 = midi_sample_q.clone();
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [i16], _| {
                         let mut rx = command_rx_i16.lock();
-                        render_callback_i16(data, &bridge, &engine, &mut rx);
+                        render_callback_i16(data, &bridge, &engine, &mut rx, &midi_i16);
                     },
                     err_fn,
                     None,
@@ -135,11 +149,12 @@ impl SharedAudio {
                 let bridge = Arc::clone(&self.bridge);
                 let engine = Arc::clone(&self.engine);
                 let command_rx_u16 = Arc::clone(&command_rx);
+                let midi_u16 = midi_sample_q.clone();
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [u16], _| {
                         let mut rx = command_rx_u16.lock();
-                        render_callback_u16(data, &bridge, &engine, &mut rx);
+                        render_callback_u16(data, &bridge, &engine, &mut rx, &midi_u16);
                     },
                     err_fn,
                     None,
@@ -176,6 +191,16 @@ impl SharedAudio {
         let mut engine = self.engine.lock();
         engine.import_loop_data(samples, length);
     }
+
+    pub fn export_sample_loop(&self) -> Option<(Vec<f32>, usize, u32)> {
+        let engine = self.engine.lock();
+        engine.export_sample_loop_data()
+    }
+
+    pub fn import_sample_loop(&self, samples: &[f32], length: usize) {
+        let mut engine = self.engine.lock();
+        engine.import_sample_loop_data(samples, length);
+    }
 }
 
 fn select_output_device(
@@ -207,11 +232,27 @@ fn device_display_name(device: &cpal::Device) -> String {
 
 /// Main render callback - MUST NOT BLOCK.
 /// Command consumer is owned by this closure (moved in at stream creation).
+fn drain_audio_commands(
+    engine: &mut AudioEngine,
+    command_rx: &mut rtrb::Consumer<AudioCommand>,
+    midi_sample_q: &Option<Arc<SegQueue<AudioCommand>>>,
+) {
+    while let Ok(cmd) = command_rx.pop() {
+        engine.process_command(cmd);
+    }
+    if let Some(mq) = midi_sample_q {
+        while let Some(cmd) = mq.pop() {
+            engine.process_command(cmd);
+        }
+    }
+}
+
 fn render_callback(
     data: &mut [f32],
     bridge: &Arc<AudioBridge>,
     engine: &Arc<Mutex<AudioEngine>>,
     command_rx: &mut rtrb::Consumer<AudioCommand>,
+    midi_sample_q: &Option<Arc<SegQueue<AudioCommand>>>,
 ) {
     let channels = 2usize;
     let frames = data.len() / channels;
@@ -220,14 +261,12 @@ fn render_callback(
     // Try to get the engine lock - if contended, output silence (rare edge case)
     // This only contends during project save/load (export_loop/import_loop)
     if let Some(mut engine) = engine.try_lock() {
-        // Load params from bridge (lock-free via arc-swap)
+        // 1) Load UI snapshot. 2) Copy sample bus into the engine (so `render_sample` reads stable data).
+        // 3) Drain commands — `SampleNoteOn` may replace `sample_params` with a fresh snapshot before arming.
         let params = bridge.load_params();
-        
-        // Drain commands from SPSC queue (lock-free, owned by audio thread)
-        while let Ok(cmd) = command_rx.pop() {
-            engine.process_command(cmd);
-        }
-        
+        engine.sample_params = params.sample.clone();
+        drain_audio_commands(&mut engine, command_rx, midi_sample_q);
+
         // Render audio
         let (synth_samples, drum_samples) = engine.render_into(&params, &mut mono);
         
@@ -260,8 +299,12 @@ fn render_callback(
             bridge.reactive.hat.store((current * 0.92).max(0.0));
         }
         
-        // Also update note activity based on synth envelope
-        bridge.reactive.note.store(if engine.env > 0.01 { 1.0 } else { 0.0 });
+        let sample_active = engine.sample_voices.iter().any(|v| v.active && v.env > 0.01);
+        bridge.reactive.note.store(if engine.env > 0.01 || sample_active {
+            1.0
+        } else {
+            0.0
+        });
         
         // Update scope buffer (uses pre-allocated pool, no allocation)
         bridge.update_scope(&mono, &synth_samples);
@@ -274,7 +317,27 @@ fn render_callback(
             if engine.loop_len > (engine.sample_rate as usize / 12) { 1 } else { 0 },
             std::sync::atomic::Ordering::Relaxed,
         );
-        
+        bridge
+            .reactive
+            .sample_loop_length
+            .store(engine.sloop_len as u64, std::sync::atomic::Ordering::Relaxed);
+        bridge
+            .reactive
+            .sample_loop_read_pos
+            .store(engine.sloop_read as u64, std::sync::atomic::Ordering::Relaxed);
+        bridge
+            .reactive
+            .sample_loop_write_pos
+            .store(engine.sloop_write as u64, std::sync::atomic::Ordering::Relaxed);
+        bridge.reactive.sample_loop_has_audio.store(
+            if engine.sloop_len > (engine.sample_rate as usize / 12) {
+                1
+            } else {
+                0
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         // Update drum sequencer state atomics
         bridge.reactive.drum_step.store(engine.seq_step as u32, std::sync::atomic::Ordering::Relaxed);
         bridge.reactive.chain_position.store(engine.chain_position as u32, std::sync::atomic::Ordering::Relaxed);
@@ -309,9 +372,10 @@ fn render_callback_i16(
     bridge: &Arc<AudioBridge>,
     engine: &Arc<Mutex<AudioEngine>>,
     command_rx: &mut rtrb::Consumer<AudioCommand>,
+    midi_sample_q: &Option<Arc<SegQueue<AudioCommand>>>,
 ) {
     let mut scratch = vec![0.0f32; data.len() / 2];
-    render_callback_core(&mut scratch, bridge, engine, command_rx);
+    render_callback_core(&mut scratch, bridge, engine, command_rx, midi_sample_q);
     for (frame, sample) in scratch.into_iter().enumerate() {
         let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         let base = frame * 2;
@@ -325,9 +389,10 @@ fn render_callback_u16(
     bridge: &Arc<AudioBridge>,
     engine: &Arc<Mutex<AudioEngine>>,
     command_rx: &mut rtrb::Consumer<AudioCommand>,
+    midi_sample_q: &Option<Arc<SegQueue<AudioCommand>>>,
 ) {
     let mut scratch = vec![0.0f32; data.len() / 2];
-    render_callback_core(&mut scratch, bridge, engine, command_rx);
+    render_callback_core(&mut scratch, bridge, engine, command_rx, midi_sample_q);
     for (frame, sample) in scratch.into_iter().enumerate() {
         let value = (((sample.clamp(-1.0, 1.0) * 0.5) + 0.5) * u16::MAX as f32) as u16;
         let base = frame * 2;
@@ -342,13 +407,12 @@ fn render_callback_core(
     bridge: &Arc<AudioBridge>,
     engine: &Arc<Mutex<AudioEngine>>,
     command_rx: &mut rtrb::Consumer<AudioCommand>,
+    midi_sample_q: &Option<Arc<SegQueue<AudioCommand>>>,
 ) {
     if let Some(mut engine) = engine.try_lock() {
         let params = bridge.load_params();
-        // Drain commands from SPSC queue (lock-free)
-        while let Ok(cmd) = command_rx.pop() {
-            engine.process_command(cmd);
-        }
+        engine.sample_params = params.sample.clone();
+        drain_audio_commands(&mut engine, command_rx, midi_sample_q);
         engine.render_into(&params, mono);
     }
 }
@@ -404,9 +468,24 @@ fn kick_sample_osc(
     ((tone + click) * amp_env * attack_env * KICK_LEVEL * makeup).clamp(-1.0, 1.0)
 }
 
+const SAMPLE_POLY: usize = 8;
+
+#[derive(Clone, Copy, Default)]
+struct SampleVoice {
+    active: bool,
+    note: u8,
+    vel: f32,
+    phase: f64,
+    env: f32,
+    releasing: bool,
+}
+
 struct AudioEngine {
     sample_rate: f32,
     sample_clock: u64,
+    sample_voices: [SampleVoice; SAMPLE_POLY],
+    /// Sample buffer + trim/gain used for playback (synced from bridge each block; `SampleNoteOn` may refresh).
+    sample_params: SampleParams,
     // Synth envelope - now properly handles retrigger from current value
     envelope: SmoothEnvelope,
     env: f32,  // Keep for UI feedback
@@ -426,6 +505,11 @@ struct AudioEngine {
     loop_len: usize,
     loop_write: usize,
     loop_read: usize,
+    /// Sample-tab performance loop buffer (records `render_sample` output only).
+    sloop_buf: Vec<f32>,
+    sloop_len: usize,
+    sloop_write: usize,
+    sloop_read: usize,
     last_output: f32,
     osc_phases: [[f32; 6]; 2],
     drum_state: [DrumVoiceState; NUM_DRUM_VOICES],
@@ -450,6 +534,11 @@ struct AudioEngine {
     drum_triggered: [bool; 6],
     // Track if we already processed a clear request
     last_clear_seen: bool,
+    sloop_recording: bool,
+    sloop_overdub: bool,
+    sloop_playing: bool,
+    sloop_gain: f32,
+    sloop_last_clear_seen: bool,
 }
 
 impl AudioEngine {
@@ -474,6 +563,10 @@ impl AudioEngine {
             loop_len: 0,
             loop_write: 0,
             loop_read: 0,
+            sloop_buf: vec![0.0; (sample_rate as usize) * MAX_LOOP_SECONDS],
+            sloop_len: 0,
+            sloop_write: 0,
+            sloop_read: 0,
             last_output: 0.0,
             osc_phases: [[0.0; 6]; 2],
             drum_state: [
@@ -500,6 +593,13 @@ impl AudioEngine {
             loop_speed: 1.0,
             drum_triggered: [false; 6],
             last_clear_seen: false,
+            sloop_recording: false,
+            sloop_overdub: false,
+            sloop_playing: false,
+            sloop_gain: 0.7,
+            sloop_last_clear_seen: false,
+            sample_voices: [SampleVoice::default(); SAMPLE_POLY],
+            sample_params: SampleParams::default(),
         }
     }
 
@@ -514,6 +614,7 @@ impl AudioEngine {
         // Recreate reverb with new sample rate
         self.reverb = SimpleReverb::new(sample_rate, 0.5, 0.3);
         self.loop_buf.resize((sample_rate as usize) * MAX_LOOP_SECONDS, 0.0);
+        self.sloop_buf.resize((sample_rate as usize) * MAX_LOOP_SECONDS, 0.0);
         // Update envelope coefficients
         self.envelope = SmoothEnvelope::new(0.01, 0.3, sample_rate);
     }
@@ -585,7 +686,166 @@ impl AudioEngine {
             AudioCommand::SnapshotLoop { length: _ } => {
                 // No-op on audio side - used by UI for undo snapshots
             }
+            AudioCommand::SampleStartRecording => {
+                self.sloop_len = 0;
+                self.sloop_write = 0;
+                self.sloop_read = 0;
+                self.sloop_recording = true;
+                self.sloop_overdub = false;
+                self.sloop_playing = false;
+                for sample in &mut self.sloop_buf {
+                    *sample = 0.0;
+                }
+            }
+            AudioCommand::SampleStartOverdub => {
+                self.sloop_recording = true;
+                self.sloop_overdub = true;
+                self.sloop_playing = true;
+            }
+            AudioCommand::SampleStopRecording => {
+                self.sloop_recording = false;
+                self.sloop_overdub = false;
+                if self.sloop_len > 0 {
+                    self.sloop_playing = true;
+                    if self.sloop_gain < 0.1 {
+                        self.sloop_gain = 0.7;
+                    }
+                }
+            }
+            AudioCommand::SampleSetPlaying(playing) => {
+                self.sloop_playing = playing;
+                if !playing {
+                    self.sloop_read = 0;
+                }
+            }
+            AudioCommand::SampleClearLoop => {
+                self.sloop_len = 0;
+                self.sloop_write = 0;
+                self.sloop_read = 0;
+                self.sloop_recording = false;
+                self.sloop_overdub = false;
+                self.sloop_playing = false;
+                for sample in &mut self.sloop_buf {
+                    *sample = 0.0;
+                }
+            }
+            AudioCommand::SampleRestoreLoop { length } => {
+                self.sloop_len = length;
+                self.sloop_write = if length > 0 { length } else { 0 };
+                self.sloop_read = 0;
+                self.sloop_recording = false;
+                self.sloop_overdub = false;
+                self.sloop_playing = length > 0;
+            }
+            AudioCommand::SampleNoteOn {
+                note,
+                velocity,
+                sample_snapshot,
+            } => {
+                if let Some(s) = sample_snapshot {
+                    if !s.buffer.is_empty() {
+                        self.sample_params = s;
+                    }
+                }
+                self.sample_note_on(note, (velocity / 127.0).clamp(0.0, 1.0));
+            }
+            AudioCommand::SampleNoteOff { note } => {
+                for v in &mut self.sample_voices {
+                    if v.active && v.note == note {
+                        v.releasing = true;
+                    }
+                }
+            }
         }
+    }
+
+    fn sample_note_on(&mut self, note: u8, velocity: f32) {
+        // Same note still held: keep the existing voice (loops in `render_sample`); do not reset phase.
+        for v in &self.sample_voices {
+            if v.active && v.note == note && !v.releasing {
+                return;
+            }
+        }
+        let vel = velocity.clamp(0.0, 1.0).max(0.004);
+        let slot = self
+            .sample_voices
+            .iter()
+            .position(|v| !v.active)
+            .unwrap_or(0);
+        self.sample_voices[slot] = SampleVoice {
+            active: true,
+            note,
+            vel,
+            phase: 0.0,
+            env: 0.0,
+            releasing: false,
+        };
+    }
+
+    fn render_sample(&mut self, frames: usize) -> Vec<f32> {
+        let s = &self.sample_params;
+        let mut out = vec![0.0f32; frames];
+        if !s.play_enabled || s.buffer.is_empty() {
+            for v in &mut self.sample_voices {
+                v.active = false;
+            }
+            return out;
+        }
+        let buf = &**s.buffer;
+        let n = buf.len();
+        if n < 2 {
+            return out;
+        }
+        let t0 = (s.trim_start.clamp(0.0, 0.95) * n as f32) as usize;
+        let t1 = (s.trim_end.clamp(0.0, 0.95) * n as f32) as usize;
+        let region = n.saturating_sub(t0).saturating_sub(t1).max(1);
+        let sr = self.sample_rate.max(1.0);
+        let atk = (s.attack.max(0.0005) * sr) as f32;
+        let rel = dsp::decay_coeff(s.release.max(0.0005), sr);
+        let rel_attack = 1.0 / atk.max(1.0);
+        let src_sr = s.sample_rate.max(1) as f32;
+        let rate_sr = src_sr / sr;
+
+        for i in 0..frames {
+            let mut acc = 0.0f32;
+            for voice in &mut self.sample_voices {
+                if !voice.active {
+                    continue;
+                }
+                let chrom = 2.0f32.powf(
+                    (voice.note as f32 - s.root_midi as f32 + s.pitch_semitones) / 12.0,
+                ) as f64;
+                let step = s.speed.clamp(0.05, 8.0) as f64 * chrom * rate_sr as f64;
+                let mut p = voice.phase;
+                // While the note is held (`!releasing`), loop within the trimmed region instead of stopping.
+                if p >= region as f64 && !voice.releasing && region > 0 {
+                    p %= region as f64;
+                    voice.phase = p;
+                }
+                let idx = t0 as f64 + voice.phase;
+                let i0 = idx.floor() as usize;
+                let frac = (idx - i0 as f64) as f32;
+                let last = (t0 + region).saturating_sub(1).min(n.saturating_sub(2));
+                let i0 = i0.min(last);
+                let s0 = buf.get(i0).copied().unwrap_or(0.0);
+                let s1 = buf.get((i0 + 1).min(n - 1)).copied().unwrap_or(s0);
+                let sig = s0 * (1.0 - frac) + s1 * frac;
+
+                if voice.releasing {
+                    voice.env *= rel;
+                    if voice.env < 0.0008 {
+                        voice.active = false;
+                    }
+                } else {
+                    voice.env = (voice.env + rel_attack).min(1.0);
+                }
+
+                acc += sig * voice.env * voice.vel * s.gain.clamp(0.0, 4.0);
+                voice.phase += step;
+            }
+            out[i] = acc;
+        }
+        out
     }
 
     fn render_into(
@@ -595,8 +855,11 @@ impl AudioEngine {
     ) -> (Vec<f32>, Vec<f32>) {
         let synth_out = self.render_synth(&params.synth, out.len());
         let loop_out = self.render_loop(&params.looper, &synth_out);
+        let sample_live = self.render_sample(out.len());
+        let sample_loop_out =
+            self.render_sample_loop(&params.sample.sample_loop, &sample_live);
         let drum_out = self.render_drums(&params.drums, out.len());
-        
+
         let mut synth_samples = vec![0.0f32; out.len()];
         let target_gain = params.synth.volume;
         // Smooth gain changes per-sample to prevent zipper noise (~5ms smoothing)
@@ -605,9 +868,13 @@ impl AudioEngine {
         for i in 0..out.len() {
             // Smooth gain toward target
             self.current_gain += (target_gain - self.current_gain) * gain_alpha;
-            synth_samples[i] = (synth_out[i] + loop_out[i]) * self.current_gain * SYNTH_BUS_GAIN;
-            // FX (drive/delay/reverb) on synth+loop only — drums stay clean and avoid limiter pile-up
-            let wet_synth = self.apply_fx_sample(synth_samples[i], &params.synth);
+            let synth_loop_bus = (synth_out[i] + loop_out[i]) * self.current_gain * SYNTH_BUS_GAIN;
+            let sample_bus =
+                (sample_live[i] + sample_loop_out[i]) * SAMPLE_BUS_GAIN;
+            // Keep scope reactive levels representative of full melodic bus.
+            synth_samples[i] = synth_loop_bus + sample_bus;
+            // FX (drive/delay/reverb) on synth+loop only — sample/drums stay direct and avoid wash.
+            let wet_synth = self.apply_fx_sample(synth_loop_bus, &params.synth) + sample_bus;
             let mut mixed = wet_synth + drum_out[i] * DRUM_BUS_GAIN;
             // Continuous soft limiting - applied to ALL samples, no conditional
             mixed = dsp::soft_limit(mixed, LIMIT_DRIVE, LIMIT_CEILING) * OUTPUT_GAIN;
@@ -848,6 +1115,99 @@ impl AudioEngine {
                 }
             }
             self.loop_read = (fractional_pos as usize) % effective_len;
+        }
+        out
+    }
+
+    /// Performance loop for the sample instrument: records `sample_live` only (not drums/synth).
+    fn render_sample_loop(
+        &mut self,
+        looper: &crate::audio_bridge::LooperParams,
+        sample_live: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0; sample_live.len()];
+
+        if looper.clear_requested && !self.sloop_last_clear_seen {
+            self.sloop_len = 0;
+            self.sloop_write = 0;
+            self.sloop_read = 0;
+            self.sloop_recording = false;
+            self.sloop_overdub = false;
+            for sample in &mut self.sloop_buf {
+                *sample = 0.0;
+            }
+            self.sloop_last_clear_seen = true;
+            return out;
+        }
+        if !looper.clear_requested {
+            self.sloop_last_clear_seen = false;
+        }
+
+        let was_rec = self.sloop_recording;
+        let now_rec = looper.recording;
+        let now_overdub = looper.overdub;
+
+        if now_rec && !was_rec {
+            if !now_overdub {
+                self.sloop_len = 0;
+                self.sloop_write = 0;
+                self.sloop_read = 0;
+                for sample in &mut self.sloop_buf {
+                    *sample = 0.0;
+                }
+            }
+        }
+
+        if !now_rec && was_rec && self.sloop_len > 0 {
+            // capture complete
+        }
+
+        self.sloop_recording = now_rec;
+        self.sloop_overdub = now_overdub;
+
+        if now_rec && !now_overdub {
+            for (i, sample) in sample_live.iter().enumerate() {
+                if self.sloop_write < self.sloop_buf.len() {
+                    self.sloop_buf[self.sloop_write] = *sample;
+                    self.sloop_write += 1;
+                    self.sloop_len = self.sloop_write;
+                }
+                if i < out.len() {
+                    out[i] = 0.0;
+                }
+            }
+        } else if now_rec && now_overdub && self.sloop_len > 0 {
+            let gain = looper.play_gain.clamp(0.0, 1.0);
+            for (i, sample) in sample_live.iter().enumerate() {
+                let idx = self.sloop_write % self.sloop_len;
+                let current = self.sloop_buf[idx];
+                self.sloop_buf[idx] = (current * 0.72 + *sample * 0.45).tanh();
+                out[i] = self.sloop_buf[self.sloop_read % self.sloop_len] * gain;
+                self.sloop_write = (self.sloop_write + 1) % self.sloop_len;
+                self.sloop_read = (self.sloop_read + 1) % self.sloop_len;
+            }
+        } else if looper.playing && self.sloop_len > 0 {
+            let gain = looper.play_gain.clamp(0.0, 1.0);
+            let speed_factor = looper.playback_speed.clamp(0.25, 4.0);
+            let trim_start_samples =
+                (looper.trim_start.clamp(0.0, 0.9) * self.sloop_len as f32) as usize;
+            let trim_end_samples =
+                (looper.trim_end.clamp(0.0, 0.9) * self.sloop_len as f32) as usize;
+            let effective_start = trim_start_samples;
+            let effective_end = self.sloop_len.saturating_sub(trim_end_samples);
+            let effective_len = effective_end.saturating_sub(effective_start).max(1);
+
+            let mut fractional_pos = self.sloop_read as f32;
+            for sample in &mut out {
+                let pos_in_region = (fractional_pos as usize) % effective_len;
+                let read_idx = effective_start + pos_in_region;
+                *sample = self.sloop_buf.get(read_idx).copied().unwrap_or(0.0) * gain;
+                fractional_pos += speed_factor;
+                if fractional_pos >= effective_len as f32 {
+                    fractional_pos -= effective_len as f32;
+                }
+            }
+            self.sloop_read = (fractional_pos as usize) % effective_len;
         }
         out
     }
@@ -1173,6 +1533,14 @@ impl AudioEngine {
         Some((data, self.loop_len, self.sample_rate as u32))
     }
 
+    fn export_sample_loop_data(&self) -> Option<(Vec<f32>, usize, u32)> {
+        if self.sloop_len == 0 {
+            return None;
+        }
+        let data = self.sloop_buf[..self.sloop_len].to_vec();
+        Some((data, self.sloop_len, self.sample_rate as u32))
+    }
+
     /// Import loop buffer contents from disk.
     fn import_loop_data(&mut self, samples: &[f32], length: usize) {
         let max_len = self.loop_buf.len();
@@ -1195,10 +1563,62 @@ impl AudioEngine {
             self.loop_gain = 0.7;
         }
     }
+
+    fn import_sample_loop_data(&mut self, samples: &[f32], length: usize) {
+        let max_len = self.sloop_buf.len();
+        let copy_len = samples.len().min(length).min(max_len);
+        for sample in &mut self.sloop_buf {
+            *sample = 0.0;
+        }
+        self.sloop_buf[..copy_len].copy_from_slice(&samples[..copy_len]);
+        self.sloop_len = copy_len;
+        self.sloop_write = copy_len;
+        self.sloop_read = 0;
+        self.sloop_playing = copy_len > 0;
+        self.sloop_recording = false;
+        self.sloop_overdub = false;
+        if self.sloop_gain < 0.1 && copy_len > 0 {
+            self.sloop_gain = 0.7;
+        }
+    }
 }
 
 fn peak_level(signal: &[f32]) -> f32 {
     signal
         .iter()
         .fold(0.0f32, |acc, value| acc.max(value.abs()))
+}
+
+#[cfg(test)]
+mod sample_playback_tests {
+    use std::sync::Arc;
+
+    use super::AudioEngine;
+    use crate::audio_bridge::{AudioCommand, AudioParams, SampleParams};
+
+    #[test]
+    fn sample_note_on_is_audible_in_mix() {
+        let mut eng = AudioEngine::new(48_000.0);
+        let buf: Vec<f32> = (0..8192)
+            .map(|i| ((i as f32) * 0.02).sin() * 0.35)
+            .collect();
+        let sp = SampleParams {
+            buffer: Arc::new(buf),
+            sample_rate: 48_000,
+            play_enabled: true,
+            ..SampleParams::default()
+        };
+        eng.sample_params = sp.clone();
+        eng.process_command(AudioCommand::SampleNoteOn {
+            note: 60,
+            velocity: 127.0,
+            sample_snapshot: Some(sp),
+        });
+        let mut params = AudioParams::default();
+        params.sample = eng.sample_params.clone();
+        let mut out = vec![0.0f32; 512];
+        eng.render_into(&params, &mut out);
+        let peak = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(peak > 1e-4, "expected non-silent output, peak={peak}");
+    }
 }

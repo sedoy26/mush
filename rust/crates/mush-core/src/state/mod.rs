@@ -5,6 +5,7 @@ pub mod drums;
 pub mod looper;
 pub mod midi;
 pub mod project;
+pub mod sample;
 pub mod synth;
 pub mod ui;
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub synth: synth::SynthState,
     pub drums: drums::DrumState,
     pub looper: looper::LoopState,
+    pub sample: sample::SampleState,
     pub midi: midi::MidiState,
     pub audio: audio::AudioState,
     pub ui: ui::UiState,
@@ -33,6 +35,7 @@ impl AppState {
             synth: self.synth.clone(),
             drums: self.drums.clone(),
             looper: self.looper.snapshot(),
+            sample: self.sample.clone(),
             midi: self.midi.clone(),
             audio: self.audio.clone(),
             ui: self.ui.clone(),
