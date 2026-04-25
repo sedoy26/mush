@@ -467,24 +467,31 @@ fn handle_settings_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEve
 }
 
 fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Result<()> {
-    if let Some(offset) = key_to_offset(&key.code) {
-        // Only swallow key-repeat bursts for the *same* held key. Do not treat a fresh `Press`
-        // as "already held" — many terminals omit `Release`, so `keyboard_note` can stay set.
-        let is_same_key_autorepeat =
-            matches!(key.kind, KeyEventKind::Repeat) && ui.keyboard_note == Some(offset);
-        if is_same_key_autorepeat {
-            ui.keyboard_note_repeat_count += 1;
+    // T/Y/U are on the chromatic row but Shift+T/Y/U are loop controls (Kitty sends `t`+Shift, etc.).
+    let loop_combo_ty_u = key_matches_shifted_base_letter(&key, 't')
+        || key_matches_shifted_base_letter(&key, 'y')
+        || key_matches_shifted_base_letter(&key, 'u');
+
+    if !loop_combo_ty_u {
+        if let Some(offset) = key_to_offset(&key.code) {
+            // Only swallow key-repeat bursts for the *same* held key. Do not treat a fresh `Press`
+            // as "already held" — many terminals omit `Release`, so `keyboard_note` can stay set.
+            let is_same_key_autorepeat =
+                matches!(key.kind, KeyEventKind::Repeat) && ui.keyboard_note == Some(offset);
+            if is_same_key_autorepeat {
+                ui.keyboard_note_repeat_count += 1;
+                ui.keyboard_note_last_repeat_at = Some(Instant::now());
+                return Ok(());
+            }
+            ui.keyboard_note = Some(offset);
+            ui.keyboard_note_repeat_count = 0;
+            ui.keyboard_note_started_at = Some(Instant::now());
             ui.keyboard_note_last_repeat_at = Some(Instant::now());
+            let mut state = runtime.state.lock();
+            state.synth.key_offset = Some(offset);
+            state.synth.key_note_on = true;
             return Ok(());
         }
-        ui.keyboard_note = Some(offset);
-        ui.keyboard_note_repeat_count = 0;
-        ui.keyboard_note_started_at = Some(Instant::now());
-        ui.keyboard_note_last_repeat_at = Some(Instant::now());
-        let mut state = runtime.state.lock();
-        state.synth.key_offset = Some(offset);
-        state.synth.key_note_on = true;
-        return Ok(());
     }
 
     let mut state = runtime.state.lock();
@@ -504,7 +511,9 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
         KeyCode::Up => state.synth.volume = (state.synth.volume + 0.05).clamp(0.0, 1.0),
         KeyCode::Down => state.synth.volume = (state.synth.volume - 0.05).clamp(0.0, 1.0),
         KeyCode::Char('1') => state.synth.active_osc = 0,
-        KeyCode::Char('2') => state.synth.active_osc = 1,
+        KeyCode::Char('2') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.active_osc = 1;
+        }
         KeyCode::Char('z') => cycle_waveform(&mut state, -1),
         KeyCode::Char('x') => cycle_waveform(&mut state, 1),
         KeyCode::Char('[') => state.synth.attack = (state.synth.attack - 0.005).clamp(0.001, 2.0),
@@ -556,28 +565,28 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
                 }
             }
         }
-        KeyCode::Char('I') => {
+        _ if key_matches_shifted_base_letter(&key, 'i') => {
             state.looper.play_gain = (state.looper.play_gain + 0.05).clamp(0.0, 1.0)
         }
-        KeyCode::Char('O') => {
+        _ if key_matches_shifted_base_letter(&key, 'o') => {
             state.looper.play_gain = (state.looper.play_gain - 0.05).clamp(0.0, 1.0)
         }
-        KeyCode::Char('@') => {
+        _ if key_shifted_digit_row(&key, '2', '@') => {
             state.looper.trim_start = (state.looper.trim_start + 0.02).clamp(0.0, 0.9)
         }
-        KeyCode::Char('#') => {
+        _ if key_shifted_digit_row(&key, '3', '#') => {
             state.looper.trim_start = (state.looper.trim_start - 0.02).clamp(0.0, 0.9)
         }
-        KeyCode::Char('$') => {
+        _ if key_shifted_digit_row(&key, '4', '$') => {
             state.looper.trim_end = (state.looper.trim_end + 0.02).clamp(0.0, 0.9)
         }
-        KeyCode::Char('%') => {
+        _ if key_shifted_digit_row(&key, '5', '%') => {
             state.looper.trim_end = (state.looper.trim_end - 0.02).clamp(0.0, 0.9)
         }
-        KeyCode::Char('^') => {
+        _ if key_shifted_digit_row(&key, '6', '^') => {
             state.looper.playback_speed = (state.looper.playback_speed * 1.1).clamp(0.25, 4.0)
         }
-        KeyCode::Char('&') => {
+        _ if key_shifted_digit_row(&key, '7', '&') => {
             state.looper.playback_speed = (state.looper.playback_speed / 1.1).clamp(0.25, 4.0)
         }
         KeyCode::Char(',') => state.synth.lfo_rate = (state.synth.lfo_rate - 0.2).clamp(0.0, 20.0),
@@ -615,29 +624,29 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
         KeyCode::Char('E') => {
             state.synth.fx.reverb = (state.synth.fx.reverb + 0.03).clamp(0.0, 1.0)
         }
-        KeyCode::Char('R') => {
+        _ if key_matches_shifted_base_letter(&key, 'r') => {
             if state.looper.recording {
                 state.looper.stop_recording();
             } else {
                 state.looper.begin_replace();
             }
         }
-        KeyCode::Char('T') => {
+        _ if key_matches_shifted_base_letter(&key, 't') => {
             if state.looper.overdub {
                 state.looper.stop_recording();
             } else {
                 state.looper.begin_overdub();
             }
         }
-        KeyCode::Char('Y') => {
+        _ if key_matches_shifted_base_letter(&key, 'y') => {
             state.looper.undo_last();
         }
-        KeyCode::Char('P') => {
+        _ if key_matches_shifted_base_letter(&key, 'p') => {
             if state.looper.has_audio {
                 state.looper.playing = !state.looper.playing;
             }
         }
-        KeyCode::Char('U') => {
+        _ if key_matches_shifted_base_letter(&key, 'u') => {
             state.looper.clear();
         }
         // Chain mode toggle (available in synth mode too)
@@ -658,35 +667,41 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
 
 /// QWERTY chromatic + arrows adjust sample root / gain; other keys reuse synth shortcuts (loop, FX, etc.).
 fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Result<()> {
-    if let Some(offset) = key_to_offset(&key.code) {
-        let is_same_key_autorepeat =
-            matches!(key.kind, KeyEventKind::Repeat) && ui.keyboard_note == Some(offset);
-        if is_same_key_autorepeat {
-            ui.keyboard_note_repeat_count += 1;
+    let loop_combo_ty_u = key_matches_shifted_base_letter(&key, 't')
+        || key_matches_shifted_base_letter(&key, 'y')
+        || key_matches_shifted_base_letter(&key, 'u');
+
+    if !loop_combo_ty_u {
+        if let Some(offset) = key_to_offset(&key.code) {
+            let is_same_key_autorepeat =
+                matches!(key.kind, KeyEventKind::Repeat) && ui.keyboard_note == Some(offset);
+            if is_same_key_autorepeat {
+                ui.keyboard_note_repeat_count += 1;
+                ui.keyboard_note_last_repeat_at = Some(Instant::now());
+                return Ok(());
+            }
+            // Same key still "down" (terminals often send extra `Press` while held). Do not retrigger;
+            // the engine loops the sample until note-off / timeout. Do not bump `last_repeat_at` here
+            // so idle timeout still sees quiet after the last real `Repeat` / initial press.
+            if ui.keyboard_note == Some(offset) {
+                return Ok(());
+            }
+            ui.keyboard_note = Some(offset);
+            ui.keyboard_note_repeat_count = 0;
+            ui.keyboard_note_started_at = Some(Instant::now());
             ui.keyboard_note_last_repeat_at = Some(Instant::now());
+            let mut state = runtime.state.lock();
+            if state.sample.has_audio() && !state.sample.play_enabled {
+                state.sample.play_enabled = true;
+            }
+            let note = state.sample.note_for_keyboard_offset(offset);
+            let sample_ok = state.sample.play_enabled && state.sample.has_audio();
+            drop(state);
+            if sample_ok {
+                runtime.queue_sample_note_on(note, 127.0);
+            }
             return Ok(());
         }
-        // Same key still "down" (terminals often send extra `Press` while held). Do not retrigger;
-        // the engine loops the sample until note-off / timeout. Do not bump `last_repeat_at` here
-        // so idle timeout still sees quiet after the last real `Repeat` / initial press.
-        if ui.keyboard_note == Some(offset) {
-            return Ok(());
-        }
-        ui.keyboard_note = Some(offset);
-        ui.keyboard_note_repeat_count = 0;
-        ui.keyboard_note_started_at = Some(Instant::now());
-        ui.keyboard_note_last_repeat_at = Some(Instant::now());
-        let mut state = runtime.state.lock();
-        if state.sample.has_audio() && !state.sample.play_enabled {
-            state.sample.play_enabled = true;
-        }
-        let note = state.sample.note_for_keyboard_offset(offset);
-        let sample_ok = state.sample.play_enabled && state.sample.has_audio();
-        drop(state);
-        if sample_ok {
-            runtime.queue_sample_note_on(note, 127.0);
-        }
-        return Ok(());
     }
 
     let mut state = runtime.state.lock();
@@ -721,39 +736,39 @@ fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent
         KeyCode::Down => {
             state.sample.gain = (state.sample.gain - 0.05).clamp(0.0, 2.5);
         }
-        KeyCode::Char('I') => {
+        _ if key_matches_shifted_base_letter(&key, 'i') => {
             state.sample.performance_loop.play_gain =
                 (state.sample.performance_loop.play_gain + 0.05).clamp(0.0, 1.0);
         }
-        KeyCode::Char('O') => {
+        _ if key_matches_shifted_base_letter(&key, 'o') => {
             state.sample.performance_loop.play_gain =
                 (state.sample.performance_loop.play_gain - 0.05).clamp(0.0, 1.0);
         }
-        KeyCode::Char('@') => {
+        _ if key_shifted_digit_row(&key, '2', '@') => {
             state.sample.performance_loop.trim_start =
                 (state.sample.performance_loop.trim_start + 0.02).clamp(0.0, 0.9);
         }
-        KeyCode::Char('#') => {
+        _ if key_shifted_digit_row(&key, '3', '#') => {
             state.sample.performance_loop.trim_start =
                 (state.sample.performance_loop.trim_start - 0.02).clamp(0.0, 0.9);
         }
-        KeyCode::Char('$') => {
+        _ if key_shifted_digit_row(&key, '4', '$') => {
             state.sample.performance_loop.trim_end =
                 (state.sample.performance_loop.trim_end + 0.02).clamp(0.0, 0.9);
         }
-        KeyCode::Char('%') => {
+        _ if key_shifted_digit_row(&key, '5', '%') => {
             state.sample.performance_loop.trim_end =
                 (state.sample.performance_loop.trim_end - 0.02).clamp(0.0, 0.9);
         }
-        KeyCode::Char('^') => {
+        _ if key_shifted_digit_row(&key, '6', '^') => {
             state.sample.performance_loop.playback_speed =
                 (state.sample.performance_loop.playback_speed * 1.1).clamp(0.25, 4.0);
         }
-        KeyCode::Char('&') => {
+        _ if key_shifted_digit_row(&key, '7', '&') => {
             state.sample.performance_loop.playback_speed =
                 (state.sample.performance_loop.playback_speed / 1.1).clamp(0.25, 4.0);
         }
-        KeyCode::Char('R') => {
+        _ if key_matches_shifted_base_letter(&key, 'r') => {
             let recording = state.sample.performance_loop.recording;
             drop(state);
             if recording {
@@ -763,7 +778,7 @@ fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent
             }
             return Ok(());
         }
-        KeyCode::Char('T') => {
+        _ if key_matches_shifted_base_letter(&key, 't') => {
             let overdub = state.sample.performance_loop.overdub;
             drop(state);
             if overdub {
@@ -773,17 +788,17 @@ fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent
             }
             return Ok(());
         }
-        KeyCode::Char('Y') => {
+        _ if key_matches_shifted_base_letter(&key, 'y') => {
             drop(state);
             runtime.undo_sample_loop();
             return Ok(());
         }
-        KeyCode::Char('P') => {
+        _ if key_matches_shifted_base_letter(&key, 'p') => {
             drop(state);
             runtime.toggle_sample_loop_playback();
             return Ok(());
         }
-        KeyCode::Char('U') => {
+        _ if key_matches_shifted_base_letter(&key, 'u') => {
             drop(state);
             runtime.clear_sample_loop();
             return Ok(());
@@ -919,7 +934,11 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
             let value = &mut state.drums.patterns[pattern][ui.drum_voice][ui.drum_step];
             *value = !*value;
         }
-        KeyCode::Char('r') | KeyCode::Enter => {
+        KeyCode::Enter => {
+            clear_confirm(ui);
+            state.drums.running = !state.drums.running;
+        }
+        KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             clear_confirm(ui);
             state.drums.running = !state.drums.running;
         }
@@ -958,11 +977,11 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
                 );
             }
         }
-        KeyCode::Char('1') => {
+        KeyCode::Char('1') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             clear_confirm(ui);
             apply_pattern(state, 0);
         }
-        KeyCode::Char('2') => {
+        KeyCode::Char('2') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             clear_confirm(ui);
             apply_pattern(state, 1);
         }
@@ -992,7 +1011,7 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
             state.drums.volumes[ui.drum_voice] =
                 (state.drums.volumes[ui.drum_voice] + 0.05).clamp(0.0, 1.0)
         }
-        KeyCode::Char('R') => {
+        _ if key_matches_shifted_base_letter(&key, 'r') => {
             clear_confirm(ui);
             if state.looper.recording {
                 state.looper.stop_recording();
@@ -1000,7 +1019,7 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
                 state.looper.begin_replace();
             }
         }
-        KeyCode::Char('T') => {
+        _ if key_matches_shifted_base_letter(&key, 't') => {
             clear_confirm(ui);
             if state.looper.overdub {
                 state.looper.stop_recording();
@@ -1008,49 +1027,49 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
                 state.looper.begin_overdub();
             }
         }
-        KeyCode::Char('Y') => {
+        _ if key_matches_shifted_base_letter(&key, 'y') => {
             clear_confirm(ui);
             state.looper.undo_last();
         }
-        KeyCode::Char('P') => {
+        _ if key_matches_shifted_base_letter(&key, 'p') => {
             clear_confirm(ui);
             if state.looper.has_audio {
                 state.looper.playing = !state.looper.playing;
             }
         }
-        KeyCode::Char('U') => {
+        _ if key_matches_shifted_base_letter(&key, 'u') => {
             clear_confirm(ui);
             state.looper.clear();
         }
-        KeyCode::Char('I') => {
+        _ if key_matches_shifted_base_letter(&key, 'i') => {
             clear_confirm(ui);
             state.looper.play_gain = (state.looper.play_gain + 0.05).clamp(0.0, 1.0)
         }
-        KeyCode::Char('O') => {
+        _ if key_matches_shifted_base_letter(&key, 'o') => {
             clear_confirm(ui);
             state.looper.play_gain = (state.looper.play_gain - 0.05).clamp(0.0, 1.0)
         }
-        KeyCode::Char('@') => {
+        _ if key_shifted_digit_row(&key, '2', '@') => {
             clear_confirm(ui);
             state.looper.trim_start = (state.looper.trim_start + 0.02).clamp(0.0, 0.9)
         }
-        KeyCode::Char('#') => {
+        _ if key_shifted_digit_row(&key, '3', '#') => {
             clear_confirm(ui);
             state.looper.trim_start = (state.looper.trim_start - 0.02).clamp(0.0, 0.9)
         }
-        KeyCode::Char('$') => {
+        _ if key_shifted_digit_row(&key, '4', '$') => {
             clear_confirm(ui);
             state.looper.trim_end = (state.looper.trim_end + 0.02).clamp(0.0, 0.9)
         }
-        KeyCode::Char('%') => {
+        _ if key_shifted_digit_row(&key, '5', '%') => {
             clear_confirm(ui);
             state.looper.trim_end = (state.looper.trim_end - 0.02).clamp(0.0, 0.9)
         }
-        KeyCode::Char('^') => {
+        _ if key_shifted_digit_row(&key, '6', '^') => {
             clear_confirm(ui);
             state.looper.playback_speed = (state.looper.playback_speed * 1.1).clamp(0.25, 4.0)
         }
-        KeyCode::Char('&') => {
+        _ if key_shifted_digit_row(&key, '7', '&') => {
             clear_confirm(ui);
             state.looper.playback_speed = (state.looper.playback_speed / 1.1).clamp(0.25, 4.0)
         }
@@ -2179,6 +2198,15 @@ fn key_matches_shifted_base_letter(key: &KeyEvent, base: char) -> bool {
     match key.code {
         KeyCode::Char(c) if c == hi => true,
         KeyCode::Char(c) if c == lo => key.modifiers.contains(KeyModifiers::SHIFT),
+        _ => false,
+    }
+}
+
+/// US-style digit row: `Char('@')` etc. or `Char('2')` + Shift. Plain digit is excluded by caller guards.
+fn key_shifted_digit_row(key: &KeyEvent, digit: char, shifted_symbol: char) -> bool {
+    match key.code {
+        KeyCode::Char(c) if c == shifted_symbol => true,
+        KeyCode::Char(c) if c == digit => key.modifiers.contains(KeyModifiers::SHIFT),
         _ => false,
     }
 }

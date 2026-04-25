@@ -1025,13 +1025,16 @@ impl AudioEngine {
             self.loop_len = 0;
             self.loop_write = 0;
             self.loop_read = 0;
-            self.loop_recording = false;
-            self.loop_overdub = false;
             for sample in &mut self.loop_buf {
                 *sample = 0.0;
             }
+            // Keep engine record flags aligned with params (e.g. `begin_replace` sets
+            // `clear_requested` and `recording` together). Do not force `recording` false here
+            // or every block re-enters `now_rec && !was_rec` and wipes the capture buffer.
+            self.loop_recording = looper.recording;
+            self.loop_overdub = looper.overdub;
             self.last_clear_seen = true;
-            return out;  // Early return after clear
+            return out; // Early return after clear (no samples written this block)
         }
         if !looper.clear_requested {
             self.last_clear_seen = false;  // Reset when flag is lowered
@@ -1131,11 +1134,11 @@ impl AudioEngine {
             self.sloop_len = 0;
             self.sloop_write = 0;
             self.sloop_read = 0;
-            self.sloop_recording = false;
-            self.sloop_overdub = false;
             for sample in &mut self.sloop_buf {
                 *sample = 0.0;
             }
+            self.sloop_recording = looper.recording;
+            self.sloop_overdub = looper.overdub;
             self.sloop_last_clear_seen = true;
             return out;
         }
