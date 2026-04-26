@@ -22,6 +22,35 @@ use crate::{
     state::{audio::AudioDeviceInfo, midi::MidiDeviceInfo, AppState},
 };
 
+/// Clear session-only fields before writing `.mush` (held keys, live recording flags, etc.).
+fn sanitize_app_state_for_disk(state: &mut AppState) {
+    state.midi.held_notes.clear();
+    state.midi.held_order.clear();
+    state.synth.key_offset = None;
+    state.synth.key_note_on = false;
+    state.synth.midi_note = None;
+    state.synth.midi_note_on = false;
+    state.sample.input_recording = false;
+    state.audio.global_recording.recording = false;
+    state.drums.triggers = [false; 6];
+    state.looper.clear_requested = false;
+    state.sample.performance_loop.clear_requested = false;
+}
+
+/// After JSON + WAV merge: ensure flags the audio engine should not act on stale clears.
+fn sanitize_app_state_after_load(state: &mut AppState) {
+    state.midi.held_notes.clear();
+    state.midi.held_order.clear();
+    state.sample.input_recording = false;
+    state.synth.key_offset = None;
+    state.synth.key_note_on = false;
+    state.synth.midi_note = None;
+    state.synth.midi_note_on = false;
+    state.looper.clear_requested = false;
+    state.sample.performance_loop.clear_requested = false;
+    state.drums.triggers = [false; 6];
+}
+
 pub struct Runtime {
     /// Application state (owned by UI thread)
     pub state: Arc<Mutex<AppState>>,
@@ -383,7 +412,6 @@ impl Runtime {
         if let Ok(midi) = midir::MidiInput::new("mush-midi") {
             let ports = midi.ports();
             let mut state = self.state.lock();
-            state.project.available = project_io::list_projects(&self.base_dir).unwrap_or_default();
             state.midi.status = format!("{} MIDI inputs", ports.len());
             let devices: Vec<MidiDeviceInfo> = ports
                 .iter()
@@ -440,6 +468,7 @@ impl Runtime {
 
     pub fn save_project(&self, name: &str) -> Result<PathBuf> {
         let mut state = self.state.lock().clone();
+        sanitize_app_state_for_disk(&mut state);
         
         // Export loop audio to WAV file if present
         if let Some((samples, length, sample_rate)) = self.audio.export_loop() {
@@ -507,7 +536,7 @@ impl Runtime {
         project_io::save_project(&self.base_dir, name, &state)
     }
 
-    pub fn load_project(&self, name: &str) -> Result<()> {
+    pub fn load_project(&mut self, name: &str) -> Result<()> {
         let mut loaded = project_io::load_project(&self.base_dir, name)?;
         
         // Try to load loop WAV if it exists
@@ -602,7 +631,30 @@ impl Runtime {
         }
         loaded.sample.performance_loop.undo_stack.clear();
 
+        sanitize_app_state_after_load(&mut loaded);
+        loaded.project.available = project_io::list_projects(&self.base_dir).unwrap_or_default();
+
         *self.state.lock() = loaded;
+
+        // Apply saved I/O routing (CPAL) and MIDI — state was deserialized but stream may still use old devices.
+        self.refresh_audio_devices();
+        if let Err(e) = self.restart_audio() {
+            self.state.lock().audio.status = format!("Audio restart after load: {e}");
+        }
+
+        let midi_on = self.state.lock().midi.enabled;
+        if midi_on {
+            let _ = self.set_midi_enabled(false);
+            if let Err(e) = self.set_midi_enabled(true) {
+                let mut s = self.state.lock();
+                s.midi.enabled = false;
+                s.midi.status = format!("MIDI reconnect failed: {e}");
+            }
+        } else {
+            let _ = self.set_midi_enabled(false);
+        }
+
+        self.push_audio_params();
         Ok(())
     }
 

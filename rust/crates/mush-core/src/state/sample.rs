@@ -33,7 +33,7 @@ pub struct SampleState {
     pub speed: f32,
     /// Semitones added to all notes (fine transpose)
     pub pitch_semitones: f32,
-    /// MIDI note that plays the sample at `speed` with no chromatic shift
+    /// Chromatic anchor (MIDI). Playback rate uses `2^((played_note - root_midi + pitch_semitones)/12)` × `speed`.
     pub root_midi: u8,
     /// Sample playback envelope (seconds)
     pub attack: f32,

@@ -376,6 +376,17 @@ fn handle_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Re
         KeyEventKind::Press | KeyEventKind::Repeat => {}
     }
 
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
+
+    // Global mix WAV: Shift+g or uppercase G — must run before tab handlers so `g` chromatic on synth/sample never swallows it.
+    if key_matches_shifted_base_letter(&key, 'g') {
+        let mut state = runtime.state.lock();
+        state.audio.global_recording.recording = !state.audio.global_recording.recording;
+        return Ok(false);
+    }
+
     if runtime.state.lock().ui.settings_open {
         return handle_settings_key(runtime, ui, key).map(|_| false);
     }
@@ -386,6 +397,9 @@ fn handle_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Re
         state.ui.help_open = new_state;
         if new_state {
             state.ui.settings_open = false;
+            ui.help_scroll = 0;
+        } else {
+            ui.help_scroll = 0;
         }
         return Ok(false);
     }
@@ -394,8 +408,28 @@ fn handle_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Re
         state.ui.settings_open = new_state;
         if new_state {
             state.ui.help_open = false;
+            ui.help_scroll = 0;
         }
         return Ok(false);
+    }
+    if state.ui.help_open {
+        match key.code {
+            KeyCode::Esc => {
+                state.ui.help_open = false;
+                ui.help_scroll = 0;
+                return Ok(false);
+            }
+            KeyCode::Up => {
+                ui.help_scroll = ui.help_scroll.saturating_sub(1);
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                ui.help_scroll = ui.help_scroll.saturating_add(1);
+                return Ok(false);
+            }
+            KeyCode::Char('q') => return Ok(true),
+            _ => return Ok(false),
+        }
     }
     match key.code {
         KeyCode::Char('q') => return Ok(true),
@@ -405,9 +439,6 @@ fn handle_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Re
                 TabFocus::Drums => TabFocus::Sample,
                 TabFocus::Sample => TabFocus::Synth,
             };
-        }
-        KeyCode::Char('G') => {
-            state.audio.global_recording.recording = !state.audio.global_recording.recording;
         }
         _ => {
             match state.ui.tab_focus {
@@ -466,6 +497,85 @@ fn handle_settings_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEve
     Ok(())
 }
 
+/// Arrows: **pitch** on ←→ (synth `base_midi` / sample **transpose** `pitch_semitones` / drum step) and **volume** on ↑↓
+/// (synth level / sample gain). Sample **root** (anchor key) is S→MAIN **Smp root**. Drums: **↑↓** voice; **[** **]** vol.
+fn shared_navigation_keys(
+    state: &mut AppState,
+    ui: &mut UiLocalState,
+    tab: TabFocus,
+    key: &KeyEvent,
+) -> bool {
+    match tab {
+        TabFocus::Synth => match key.code {
+            KeyCode::Left => {
+                state.synth.base_midi = (state.synth.base_midi - 1).clamp(0, 127);
+                true
+            }
+            KeyCode::Right => {
+                state.synth.base_midi = (state.synth.base_midi + 1).clamp(0, 127);
+                true
+            }
+            KeyCode::Up => {
+                state.synth.volume = (state.synth.volume + 0.05).clamp(0.0, 1.0);
+                true
+            }
+            KeyCode::Down => {
+                state.synth.volume = (state.synth.volume - 0.05).clamp(0.0, 1.0);
+                true
+            }
+            _ => false,
+        },
+        TabFocus::Sample => match key.code {
+            KeyCode::Left => {
+                state.sample.pitch_semitones = (state.sample.pitch_semitones - 0.5).clamp(-24.0, 24.0);
+                true
+            }
+            KeyCode::Right => {
+                state.sample.pitch_semitones = (state.sample.pitch_semitones + 0.5).clamp(-24.0, 24.0);
+                true
+            }
+            KeyCode::Up => {
+                state.sample.gain = (state.sample.gain + 0.05).clamp(0.0, 2.5);
+                true
+            }
+            KeyCode::Down => {
+                state.sample.gain = (state.sample.gain - 0.05).clamp(0.0, 2.5);
+                true
+            }
+            _ => false,
+        },
+        TabFocus::Drums => match key.code {
+            KeyCode::Left => {
+                ui.drum_step = ui.drum_step.saturating_sub(1);
+                true
+            }
+            KeyCode::Right => {
+                ui.drum_step = (ui.drum_step + 1).min(31);
+                true
+            }
+            KeyCode::Up => {
+                ui.drum_voice = ui.drum_voice.saturating_sub(1);
+                true
+            }
+            KeyCode::Down => {
+                ui.drum_voice = (ui.drum_voice + 1).min(5);
+                true
+            }
+            KeyCode::Char('[') => {
+                state.drums.volumes[ui.drum_voice] =
+                    (state.drums.volumes[ui.drum_voice] - 0.05).clamp(0.0, 1.0);
+                true
+            }
+            KeyCode::Char(']') => {
+                state.drums.volumes[ui.drum_voice] =
+                    (state.drums.volumes[ui.drum_voice] + 0.05).clamp(0.0, 1.0);
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
 fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Result<()> {
     // T/Y/U are on the chromatic row but Shift+T/Y/U are loop controls (Kitty sends `t`+Shift, etc.).
     let loop_combo_ty_u = key_matches_shifted_base_letter(&key, 't')
@@ -495,6 +605,9 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
     }
 
     let mut state = runtime.state.lock();
+    if shared_navigation_keys(&mut state, ui, TabFocus::Synth, &key) {
+        return Ok(());
+    }
     match key.code {
         KeyCode::Char(' ') => {
             state.synth.key_note_on = false;
@@ -506,18 +619,26 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
             ui.keyboard_note_released_at = Some(Instant::now());
             return Ok(());
         }
-        KeyCode::Left => state.synth.base_midi = (state.synth.base_midi - 1).clamp(0, 127),
-        KeyCode::Right => state.synth.base_midi = (state.synth.base_midi + 1).clamp(0, 127),
-        KeyCode::Up => state.synth.volume = (state.synth.volume + 0.05).clamp(0.0, 1.0),
-        KeyCode::Down => state.synth.volume = (state.synth.volume - 0.05).clamp(0.0, 1.0),
         KeyCode::Char('1') => state.synth.active_osc = 0,
         KeyCode::Char('2') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             state.synth.active_osc = 1;
         }
         KeyCode::Char('z') => cycle_waveform(&mut state, -1),
         KeyCode::Char('x') => cycle_waveform(&mut state, 1),
-        KeyCode::Char('[') => state.synth.attack = (state.synth.attack - 0.005).clamp(0.001, 2.0),
-        KeyCode::Char(']') => state.synth.attack = (state.synth.attack + 0.005).clamp(0.001, 2.0),
+        // Attack: plain [ ] (terminals that send Shift+[ as Char('{') use the arms below instead).
+        KeyCode::Char('[') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.attack = (state.synth.attack - 0.005).clamp(0.001, 2.0)
+        }
+        KeyCode::Char(']') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.attack = (state.synth.attack + 0.005).clamp(0.001, 2.0)
+        }
+        // Some terminals (Kitty) report Shift+[ as Char('[')+Shift, not Char('{') — treat as release.
+        KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.release = (state.synth.release - 0.005).clamp(0.0001, 4.0)
+        }
+        KeyCode::Char(']') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.release = (state.synth.release + 0.005).clamp(0.0001, 4.0)
+        }
         KeyCode::Char('{') => state.synth.release = (state.synth.release - 0.005).clamp(0.0001, 4.0),
         KeyCode::Char('}') => state.synth.release = (state.synth.release + 0.005).clamp(0.0001, 4.0),
         KeyCode::Char('m') => {
@@ -530,7 +651,9 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
                 mush_core::state::synth::GateMode::Trigger
             }
         }
-        KeyCode::Char('p') => state.synth.filter_on = !state.synth.filter_on,
+        KeyCode::Char('p') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.filter_on = !state.synth.filter_on
+        }
         KeyCode::Char('-') => state.synth.cutoff = (state.synth.cutoff - 0.03).clamp(0.0, 1.0),
         KeyCode::Char('=') => state.synth.cutoff = (state.synth.cutoff + 0.03).clamp(0.0, 1.0),
         KeyCode::Char('_') => {
@@ -552,7 +675,7 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
                 }
             }
         }
-        KeyCode::Char('o') => {
+        KeyCode::Char('o') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             state.synth.lfo_target = match state.synth.lfo_target {
                 mush_core::state::synth::LfoTarget::Pitch => {
                     mush_core::state::synth::LfoTarget::Volume
@@ -657,15 +780,12 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
             let p = state.drums.current_pattern;
             state.drums.chain_push(p);
         }
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ui.should_quit = true
-        }
         _ => {}
     }
     Ok(())
 }
 
-/// QWERTY chromatic + arrows adjust sample root / gain; other keys reuse synth shortcuts (loop, FX, etc.).
+/// QWERTY chromatic + arrows for transpose/gain + **sample performance loop** only (no synth osc/FX/filter).
 fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Result<()> {
     let loop_combo_ty_u = key_matches_shifted_base_letter(&key, 't')
         || key_matches_shifted_base_letter(&key, 'y')
@@ -705,6 +825,9 @@ fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent
     }
 
     let mut state = runtime.state.lock();
+    if shared_navigation_keys(&mut state, ui, TabFocus::Sample, &key) {
+        return Ok(());
+    }
     match key.code {
         KeyCode::Char(' ') => {
             if let Some(off) = ui.keyboard_note {
@@ -723,18 +846,6 @@ fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent
                 ui.keyboard_note_released_at = Some(Instant::now());
             }
             return Ok(());
-        }
-        KeyCode::Left => {
-            state.sample.root_midi = state.sample.root_midi.saturating_sub(1);
-        }
-        KeyCode::Right => {
-            state.sample.root_midi = (state.sample.root_midi as u16 + 1).min(127) as u8;
-        }
-        KeyCode::Up => {
-            state.sample.gain = (state.sample.gain + 0.05).clamp(0.0, 2.5);
-        }
-        KeyCode::Down => {
-            state.sample.gain = (state.sample.gain - 0.05).clamp(0.0, 2.5);
         }
         _ if key_matches_shifted_base_letter(&key, 'i') => {
             state.sample.performance_loop.play_gain =
@@ -803,10 +914,7 @@ fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent
             runtime.clear_sample_loop();
             return Ok(());
         }
-        _ => {
-            drop(state);
-            return handle_synth_key(runtime, ui, key);
-        }
+        _ => {}
     }
     Ok(())
 }
@@ -911,23 +1019,12 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
             && ui.drum_notice_until.map_or(false, |until| now < until)
     };
 
+    if shared_navigation_keys(state, ui, TabFocus::Drums, &key) {
+        clear_confirm(ui);
+        return;
+    }
+
     match key.code {
-        KeyCode::Left => {
-            clear_confirm(ui);
-            ui.drum_step = ui.drum_step.saturating_sub(1);
-        }
-        KeyCode::Right => {
-            clear_confirm(ui);
-            ui.drum_step = (ui.drum_step + 1).min(31);
-        }
-        KeyCode::Up => {
-            clear_confirm(ui);
-            ui.drum_voice = ui.drum_voice.saturating_sub(1);
-        }
-        KeyCode::Down => {
-            clear_confirm(ui);
-            ui.drum_voice = (ui.drum_voice + 1).min(5);
-        }
         KeyCode::Char(' ') => {
             clear_confirm(ui);
             let pattern = state.drums.current_pattern;
@@ -1000,78 +1097,6 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
         KeyCode::Char('>') => {
             clear_confirm(ui);
             state.drums.bpm = (state.drums.bpm + 5.0).clamp(40.0, 300.0)
-        }
-        KeyCode::Char('-') => {
-            clear_confirm(ui);
-            state.drums.volumes[ui.drum_voice] =
-                (state.drums.volumes[ui.drum_voice] - 0.05).clamp(0.0, 1.0)
-        }
-        KeyCode::Char('=') => {
-            clear_confirm(ui);
-            state.drums.volumes[ui.drum_voice] =
-                (state.drums.volumes[ui.drum_voice] + 0.05).clamp(0.0, 1.0)
-        }
-        _ if key_matches_shifted_base_letter(&key, 'r') => {
-            clear_confirm(ui);
-            if state.looper.recording {
-                state.looper.stop_recording();
-            } else {
-                state.looper.begin_replace();
-            }
-        }
-        _ if key_matches_shifted_base_letter(&key, 't') => {
-            clear_confirm(ui);
-            if state.looper.overdub {
-                state.looper.stop_recording();
-            } else {
-                state.looper.begin_overdub();
-            }
-        }
-        _ if key_matches_shifted_base_letter(&key, 'y') => {
-            clear_confirm(ui);
-            state.looper.undo_last();
-        }
-        _ if key_matches_shifted_base_letter(&key, 'p') => {
-            clear_confirm(ui);
-            if state.looper.has_audio {
-                state.looper.playing = !state.looper.playing;
-            }
-        }
-        _ if key_matches_shifted_base_letter(&key, 'u') => {
-            clear_confirm(ui);
-            state.looper.clear();
-        }
-        _ if key_matches_shifted_base_letter(&key, 'i') => {
-            clear_confirm(ui);
-            state.looper.play_gain = (state.looper.play_gain + 0.05).clamp(0.0, 1.0)
-        }
-        _ if key_matches_shifted_base_letter(&key, 'o') => {
-            clear_confirm(ui);
-            state.looper.play_gain = (state.looper.play_gain - 0.05).clamp(0.0, 1.0)
-        }
-        _ if key_shifted_digit_row(&key, '2', '@') => {
-            clear_confirm(ui);
-            state.looper.trim_start = (state.looper.trim_start + 0.02).clamp(0.0, 0.9)
-        }
-        _ if key_shifted_digit_row(&key, '3', '#') => {
-            clear_confirm(ui);
-            state.looper.trim_start = (state.looper.trim_start - 0.02).clamp(0.0, 0.9)
-        }
-        _ if key_shifted_digit_row(&key, '4', '$') => {
-            clear_confirm(ui);
-            state.looper.trim_end = (state.looper.trim_end + 0.02).clamp(0.0, 0.9)
-        }
-        _ if key_shifted_digit_row(&key, '5', '%') => {
-            clear_confirm(ui);
-            state.looper.trim_end = (state.looper.trim_end - 0.02).clamp(0.0, 0.9)
-        }
-        _ if key_shifted_digit_row(&key, '6', '^') => {
-            clear_confirm(ui);
-            state.looper.playback_speed = (state.looper.playback_speed * 1.1).clamp(0.25, 4.0)
-        }
-        _ if key_shifted_digit_row(&key, '7', '&') => {
-            clear_confirm(ui);
-            state.looper.playback_speed = (state.looper.playback_speed / 1.1).clamp(0.25, 4.0)
         }
         // Pattern navigation: { and } to cycle patterns
         KeyCode::Char('{') => {
@@ -1165,6 +1190,12 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         "HLD"
     } else {
         "OFF"
+    };
+    // Loop status text follows tab; gain/trim/speed row must match the same loop (synth vs sample).
+    let loop_panel = if matches!(state.ui.tab_focus, TabFocus::Sample) {
+        &state.sample.performance_loop
+    } else {
+        &state.looper
     };
     let mut canvas = Canvas::new(term_w, term_h.max(36));
 
@@ -1344,7 +1375,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(
         left_x + 18,
         11,
-        &format!("{:02}", state.looper.undo_stack.len()),
+        &format!("{:02}", loop_panel.undo_stack.len()),
         UiStyle::Hint,
     );
     canvas.text_style(left_x + 22, 11, "XR", UiStyle::Label);
@@ -1363,7 +1394,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(
         left_x + 6,
         13,
-        &format!("{:>3}%", (state.looper.play_gain * 100.0) as i32),
+        &format!("{:>3}%", (loop_panel.play_gain * 100.0) as i32),
         UiStyle::Value,
     );
     
@@ -1371,7 +1402,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(
         left_x + 16,
         13,
-        &format!("{:>3}%", (state.looper.trim_start * 100.0) as i32),
+        &format!("{:>3}%", (loop_panel.trim_start * 100.0) as i32),
         UiStyle::Value,
     );
     
@@ -1380,7 +1411,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(
         left_x + 26,
         13,
-        &format!("{:>3}%", ((1.0 - state.looper.trim_end) * 100.0) as i32),
+        &format!("{:>3}%", ((1.0 - loop_panel.trim_end) * 100.0) as i32),
         UiStyle::Value,
     );
 
@@ -1389,7 +1420,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(
         left_x + 6,
         14,
-        &format!("{:.2}x", state.looper.playback_speed),
+        &format!("{:.2}x", loop_panel.playback_speed),
         UiStyle::Value,
     );
 
@@ -1537,8 +1568,9 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         "no sample loaded".to_string()
     } else {
         format!(
-            "{}  G{:.2} Sp{:.2} {} {}",
+            "{} {:+.1}st  G{:.2} Sp{:.2} {} {}",
             note_name(state.sample.root_midi as i16),
+            state.sample.pitch_semitones,
             state.sample.gain,
             state.sample.speed,
             if state.sample.play_enabled { "PLAY" } else { "MUTE" },
@@ -1563,7 +1595,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         left_x + 2,
         sample_top + 5,
         &short_label(
-            "S:MAIN  TAB:SMP  ←→:root  ↑↓:gain",
+            "S:MAIN  TAB:SMP  ←→:±½st  ↑↓:gain  root:S→MAIN",
             smp_inner,
         ),
         UiStyle::Hint,
@@ -1843,13 +1875,11 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         "Row 1 switches page. Use [ and ] to page through tabs. ↑↓ select, ←→ change, Enter/Space run. S/Esc close."
             .to_string()
     } else if matches!(state.ui.tab_focus, TabFocus::Synth) {
-        "TAB=next | R/T/Y/P/U loop | \\ chain | | add | G wav | S settings".to_string()
+        "TAB | ←→ pitch ↑↓ vol | a..k notes | R/T/Y/P/U loop | \\ | Sh+G WAV | S settings".to_string()
     } else if matches!(state.ui.tab_focus, TabFocus::Sample) {
-        "TAB=synth | ←→ root ↑↓ gain | a..k notes | R/T/Y/P/U sample loop (not synth) | S settings"
-            .to_string()
+        "TAB | ←→ tune ±½st ↑↓ gain | a..k notes | R/T/Y/P/U loop | Sh+G WAV | S settings (Smp root)".to_string()
     } else {
-        "TAB=synth | ←→↑↓ move | SPC toggle | r run | {/} pattern | \\ chain | | add | BS rem | S settings"
-            .to_string()
+        "TAB | ←→ step ↑↓ voice | [ ] vol | SPC | r run | Sh+G WAV | , . BPM | { } pat | S settings".to_string()
     };
     canvas.text(5, footer_y, &footer);
 
@@ -1925,14 +1955,22 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         );
     }
 
-    if state.ui.help_open {
-        let box_w = term_w.saturating_sub(4).min(100).max(70);
-        let box_h = term_h.saturating_sub(4).clamp(24, 36);
-        let box_x = (term_w.saturating_sub(box_w)) / 2;
-        let box_y = (term_h.saturating_sub(box_h)) / 2;
-        let inner_max_x = box_x + box_w - 1;
+    let help_overlay = state
+        .ui
+        .help_open
+        .then(|| compute_help_overlay(term_w, term_h));
+    if let Some((help_rows, box_w, box_h, box_x, box_y, inner_max_x)) = &help_overlay {
         canvas.fill_rect(box_x + 1, box_y + 1, box_w - 2, box_h - 2, UiStyle::Backdrop);
-        draw_help_overlay(&mut canvas, box_x, box_y, box_w, box_h, inner_max_x);
+        draw_help_overlay(
+            &mut canvas,
+            *box_x,
+            *box_y,
+            *box_w,
+            *box_h,
+            *inner_max_x,
+            ui,
+            help_rows,
+        );
     }
 
     // Set overlay mask for settings/help panel so visual doesn't cover them
@@ -1947,12 +1985,8 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         let box_x = (term_w.saturating_sub(box_w)) / 2;
         let box_y = (term_h.saturating_sub(box_h)) / 2;
         ui.overlay_mask = Some((box_x, box_y, box_w, box_h));
-    } else if state.ui.help_open {
-        let box_w = term_w.saturating_sub(4).min(100).max(70);
-        let box_h = term_h.saturating_sub(4).clamp(24, 36);
-        let box_x = (term_w.saturating_sub(box_w)) / 2;
-        let box_y = (term_h.saturating_sub(box_h)) / 2;
-        ui.overlay_mask = Some((box_x, box_y, box_w, box_h));
+    } else if let Some((_, box_w, box_h, box_x, box_y, _)) = &help_overlay {
+        ui.overlay_mask = Some((*box_x, *box_y, *box_w, *box_h));
     }
 
     Ok(canvas.finish(state.ui.theme))
@@ -2154,7 +2188,6 @@ struct UiLocalState {
     drum_notice_until: Option<Instant>,
     settings_cursor: usize,
     project_index: usize,
-    should_quit: bool,
     visuals: VisualRegistry,
     visual_fb: Framebuffer,
     /// Colored visual lines for framebuffer-based effects (with embedded ANSI codes)
@@ -2163,6 +2196,8 @@ struct UiLocalState {
     visual_pos: (usize, usize),
     /// Mask region where visual overlay should NOT draw (settings/help box): (x, y, w, h)
     overlay_mask: Option<(usize, usize, usize, usize)>,
+    /// First visible body line index in the help overlay (see `draw_help_overlay`).
+    help_scroll: usize,
 }
 
 impl Default for UiLocalState {
@@ -2180,12 +2215,12 @@ impl Default for UiLocalState {
             drum_notice_until: None,
             settings_cursor: 0,
             project_index: 0,
-            should_quit: false,
             visuals: VisualRegistry::new(),
             visual_fb: Framebuffer::new(80, 20),
             visual_colored_lines: Vec::new(),
             visual_pos: (0, 0),
             overlay_mask: None,
+            help_scroll: 0,
         }
     }
 }
@@ -2376,47 +2411,69 @@ fn settings_tabs(page: SettingsPage, width: usize) -> String {
     short_label(&out, width)
 }
 
-fn draw_help_overlay(canvas: &mut Canvas, x: usize, y: usize, width: usize, height: usize, max_x: usize) {
-    canvas.boxed_style(x, y, width, height, " MUSH HELP ", UiStyle::Scope);
-    canvas.text_clipped(
-        x + 2,
-        y + 1,
-        &short_label("Terminal synth + drums + looper", width.saturating_sub(4)),
-        UiStyle::Backdrop,
-        max_x,
-    );
-    if width >= 72 {
-        canvas.text_clipped(
-            x + width.saturating_sub(12),
-            y + 1,
-            "H close",
-            UiStyle::Backdrop,
-            max_x,
-        );
-    } else {
-        canvas.text_clipped(x + 2, y + 2, "H close", UiStyle::Backdrop, max_x);
-    }
-    canvas.text_clipped(
-        x + 2,
-        y + 3,
-        &"─".repeat(width.saturating_sub(6)),
-        UiStyle::Backdrop,
-        max_x,
-    );
-    let sections = [
+const HELP_BODY_VIEWPORT_CAP: usize = 22;
+
+enum HelpPaintRow {
+    SectionTitle(String),
+    Blank,
+    KeyLine {
+        key: String,
+        desc: String,
+        key_col_w: usize,
+    },
+}
+
+fn compute_help_overlay(
+    term_w: usize,
+    term_h: usize,
+) -> (
+    Vec<HelpPaintRow>,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
+    let box_w = term_w.saturating_sub(4).min(100).max(70);
+    let inner_w = box_w.saturating_sub(4).max(20);
+    let help_rows = build_help_paint_rows(inner_w);
+    let body_visible = help_rows.len().min(HELP_BODY_VIEWPORT_CAP).max(1);
+    let box_h = (body_visible + 6)
+        .min(term_h.saturating_sub(4))
+        .max(7);
+    let box_x = (term_w.saturating_sub(box_w)) / 2;
+    let box_y = (term_h.saturating_sub(box_h)) / 2;
+    let inner_max_x = box_x + box_w - 1;
+    (help_rows, box_w, box_h, box_x, box_y, inner_max_x)
+}
+
+fn build_help_paint_rows(inner_w: usize) -> Vec<HelpPaintRow> {
+    let sections: [(&str, Vec<(&str, &str)>); 5] = [
         (
             "PLAY NOTES",
             vec![
                 (
                     "[a w s e d f t g y h u j k]",
-                    "Chromatic keyboard from current root.",
+                    "Chromatic keys: semitone offsets from synth base or sample anchor (S→MAIN Smp root).",
                 ),
                 (
                     "[MIDI keys]",
                     "External MIDI notes play synth.",
                 ),
-                ("[←] [→]", "Move root note down or up."),
-                ("[SPC]", "Release held note."),
+                (
+                    "[TAB]",
+                    "Switch between Synth / Drums / Sample modes.",
+                ),
+                (
+                    "[←] [→]",
+                    "Synth: base pitch. Sample: transpose ±½ st. Drums: step.",
+                ),
+                (
+                    "[↑] [↓]",
+                    "Volume: synth / sample gain. Drums: move voice (instrument row).",
+                ),
+                ("[[ ] []]", "Drums: row volume down / up."),
+                ("[SPC]", "Release held note (synth/sample)."),
             ],
         ),
         (
@@ -2424,19 +2481,25 @@ fn draw_help_overlay(canvas: &mut Canvas, x: usize, y: usize, width: usize, heig
             vec![
                 ("[1] [2]", "Select osc 1 or 2."),
                 ("[z] [x]", "Change selected waveform."),
-                ("[↑] [↓]", "Master volume."),
-                ("[[ ] [{ }]", "Attack and release."),
+                ("[↑] [↓]", "Synth master volume."),
+                (
+                    "[ [ ] ] [ { } ]",
+                    "Attack and Release",
+                ),
                 ("[m]", "Toggle gate/free mode."),
             ],
         ),
         (
             "MOD + FILTER + FX",
             vec![
-                ("[l] [o]", "LFO wave and target."),
+                (
+                    "[l] [o]",
+                    "LFO wave and target.",
+                ),
                 ("[,] [.] [;] [']", "LFO rate and depth."),
                 (
                     "[p] [-] [=] [_] [+]",
-                    "Filter cutoff/resonance.",
+                    "Plain p: filter on/off. [-] [=] cutoff, [_] [+] resonance. Shift+P is loop play (Synth/Sample).",
                 ),
                 (
                     "[D] [F] [J] [K] [N] [M] [V] [B]",
@@ -2453,109 +2516,184 @@ fn draw_help_overlay(canvas: &mut Canvas, x: usize, y: usize, width: usize, heig
             "LOOP + DRUMS",
             vec![
                 (
-                    "[R]",
-                    "Record: start new loop (replace). Stop: save and auto-play.",
+                    "[R] [T] [Y] [P] [U]",
+                    "Shift+letter: Synth tab → main synth loop; Sample tab → sample performance loop (separate buffers). Drums: no loop.",
                 ),
                 (
-                    "[T]",
-                    "Overdub: toggle layering audio over existing loop.",
+                    "[Shift+G] / uppercase G",
+                    "Global mix record to WAV from any tab. On Synth/Sample, plain g is still a chromatic key.",
                 ),
-                ("[Y]", "Undo: step back the last overdub layer."),
                 (
-                    "[P]",
-                    "Play/stop: toggle loop playback (only if loop exists).",
-                ),
-                ("[U]", "Clear: erase entire loop, return to idle."),
-                ("[G]", "Global mix record to WAV."),
-                ("[TAB]", "Cycle focus: synth → drums → sample (notes/MIDI target)."),
-                (
-                    "[←] [→] [↑] [↓]",
-                    "Move around the drum grid.",
+                    "[Drums]",
+                    "←→ step, ↑↓ voice, [ ] row volume.",
                 ),
                 (
                     "[SPC] [r] [c] [X] [1] [2]",
                     "Toggle step/run, clear, load pattern.",
                 ),
-                ("[[] []]", "Settings: [ ] tabs, arrows change."),
+                ("[Settings]", "S / Esc — [ ] pages, arrows adjust row."),
             ],
         ),
         (
             "LOOP EDITING",
             vec![
-                ("[I] [O]", "Gain up/down: increase or decrease loop volume."),
+                ("[I] [O]", "Loop gain up/down (Synth or Sample tab)."),
                 (
-                    "[Shift+2] [Shift+3]",
-                    "Start: move loop start position forward/back.",
+                    "Shift+2 @ / Shift+3 #",
+                    "Trim loop start forward / back.",
                 ),
                 (
-                    "[Shift+4] [Shift+5]",
-                    "End: move loop end position back/forward.",
+                    "Shift+4 $ / Shift+5 %",
+                    "Trim loop end forward / back.",
                 ),
                 (
-                    "[Shift+6] [Shift+7]",
-                    "Speed up/down: time-stretch playback (0.25x–4.0x).",
+                    "Shift+6 ^ / Shift+7 &",
+                    "Time-stretch faster / slower (0.25x–4x).",
                 ),
             ],
         ),
     ];
 
-    let col_gap = 2;
-    let inner_w = width.saturating_sub(4);
-    let use_two_cols = inner_w >= 72 && height >= 20;
-    if use_two_cols {
-        let col_w = (inner_w - col_gap) / 2;
-        let mut col_y = [y + 3, y + 3];
-        for (idx, (title, rows)) in sections.into_iter().enumerate() {
-            let col = idx % 2;
-            let col_x = x + 2 + col * (col_w + col_gap);
-            col_y[col] = draw_help_section(canvas, col_x, col_y[col], col_w, title, &rows, max_x);
+    let mut out: Vec<HelpPaintRow> = Vec::new();
+    for (title, rows) in sections.iter() {
+        out.push(HelpPaintRow::SectionTitle(format!("* {title}")));
+        let max_kw = rows
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(inner_w.saturating_sub(12))
+            .max(6);
+        for (keys, desc) in rows.iter() {
+            let desc_w = inner_w.saturating_sub(max_kw + 2).max(1);
+            let wrapped = wrap_text(desc, desc_w);
+            for (i, line) in wrapped.iter().enumerate() {
+                out.push(HelpPaintRow::KeyLine {
+                    key: if i == 0 {
+                        (*keys).to_string()
+                    } else {
+                        String::new()
+                    },
+                    desc: line.clone(),
+                    key_col_w: max_kw,
+                });
+            }
         }
-    } else {
-        let mut cy = y + 3;
-        for (title, rows) in sections {
-            cy = draw_help_section(canvas, x + 2, cy, inner_w, title, &rows, max_x);
-        }
+        out.push(HelpPaintRow::Blank);
     }
+    out
 }
 
-fn draw_help_section(
+fn draw_help_overlay(
     canvas: &mut Canvas,
     x: usize,
     y: usize,
     width: usize,
-    title: &str,
-    rows: &[(&str, &str)],
+    height: usize,
     max_x: usize,
-) -> usize {
-    canvas.text_clipped(x, y, &short_label(&format!(" {} ", title), width), UiStyle::Header, max_x);
+    ui: &mut UiLocalState,
+    help_rows: &[HelpPaintRow],
+) {
+    canvas.boxed_style(x, y, width, height, " MUSH HELP ", UiStyle::Scope);
+    let inner_w = width.saturating_sub(4).max(20);
+    // Rows reserved above the scroll region (title + separator + footer).
+    let header_rows = 4usize;
+    let footer_rows = 2usize;
+    let body_h = height.saturating_sub(header_rows + footer_rows).max(1);
+
     canvas.text_clipped(
-        x,
+        x + 2,
         y + 1,
-        &"─".repeat(width.saturating_sub(1).min(width)),
+        &short_label("Terminal synth + drums + looper", inner_w),
         UiStyle::Backdrop,
         max_x,
     );
-    let key_w = width.clamp(14, 24) / 3 + 6;
-    let desc_w = width.saturating_sub(key_w + 3);
-    let mut cy = y + 2;
-    for (keys, desc) in rows {
-        let key_lines = wrap_text(keys, key_w);
-        let desc_lines = wrap_text(desc, desc_w);
-        let row_h = key_lines.len().max(desc_lines.len());
-        for idx in 0..row_h {
-            if let Some(line) = key_lines.get(idx) {
-                canvas.text_clipped(x, cy + idx, &short_label(line, key_w), UiStyle::Cursor, max_x);
+    if width >= 72 {
+        canvas.text_clipped(
+            x + width.saturating_sub(12),
+            y + 1,
+            "H close",
+            UiStyle::Backdrop,
+            max_x,
+        );
+    } else {
+        canvas.text_clipped(x + 2, y + 2, "H close", UiStyle::Backdrop, max_x);
+    }
+    let sep_y = y + 3;
+    canvas.text_clipped(
+        x + 2,
+        sep_y,
+        &"─".repeat(inner_w.min(120)),
+        UiStyle::Backdrop,
+        max_x,
+    );
+    let body_top = sep_y + 1;
+
+    let max_scroll = help_rows.len().saturating_sub(body_h);
+    ui.help_scroll = ui.help_scroll.min(max_scroll);
+
+    for (i, row) in help_rows
+        .iter()
+        .skip(ui.help_scroll)
+        .take(body_h)
+        .enumerate()
+    {
+        let rowy = body_top + i;
+        match row {
+            HelpPaintRow::SectionTitle(t) => {
+                canvas.text_clipped(
+                    x + 2,
+                    rowy,
+                    &short_label(t, inner_w),
+                    UiStyle::Header,
+                    max_x,
+                );
             }
-            if idx == 0 {
-                canvas.text_clipped(x + key_w, cy + idx, "→", UiStyle::Backdrop, max_x);
-            }
-            if let Some(line) = desc_lines.get(idx) {
-                canvas.text_clipped(x + key_w + 2, cy + idx, &short_label(line, desc_w), UiStyle::Backdrop, max_x);
+            HelpPaintRow::Blank => {}
+            HelpPaintRow::KeyLine {
+                key,
+                desc,
+                key_col_w,
+            } => {
+                if !key.is_empty() {
+                    canvas.text_clipped(
+                        x + 2,
+                        rowy,
+                        &short_label(key, *key_col_w),
+                        UiStyle::Cursor,
+                        max_x,
+                    );
+                }
+                let desc_x = x + 2 + key_col_w + 2;
+                let desc_w = inner_w.saturating_sub(*key_col_w + 2).max(1);
+                canvas.text_clipped(
+                    desc_x,
+                    rowy,
+                    &short_label(desc, desc_w),
+                    UiStyle::Backdrop,
+                    max_x,
+                );
             }
         }
-        cy += row_h;
     }
-    cy
+
+    let footer = if max_scroll > 0 {
+        format!(
+            "Lines {}-{} of {} | Up/Down | Esc | H",
+            ui.help_scroll + 1,
+            (ui.help_scroll + body_h).min(help_rows.len()),
+            help_rows.len()
+        )
+    } else {
+        "Esc close | H help".to_string()
+    };
+    canvas.text_clipped(
+        x + 2,
+        y + height.saturating_sub(2),
+        &short_label(&footer, inner_w),
+        UiStyle::Backdrop,
+        max_x,
+    );
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {

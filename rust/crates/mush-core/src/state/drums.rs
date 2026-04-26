@@ -328,8 +328,8 @@ pub struct DrumState {
     pub current_step: usize,
     /// Selected drum bank
     pub bank: usize,
-    /// Manual triggers (from keyboard/MIDI)
-    #[serde(default)]
+    /// One-shot pad hits — session-only, not persisted.
+    #[serde(skip, default)]
     pub triggers: [bool; NUM_DRUM_VOICES],
     /// Chain of pattern indices to play in order
     #[serde(default)]

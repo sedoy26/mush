@@ -170,9 +170,10 @@ pub struct MidiState {
     pub note_map: HashMap<u8, u8>,
     #[serde(default)]
     pub bindings: HashMap<MidiBindingTarget, Option<u8>>,
-    #[serde(default)]
+    /// Session-only (never written to `.mush`; always empty on load).
+    #[serde(skip, default)]
     pub held_notes: HashMap<u8, u8>,
-    #[serde(default)]
+    #[serde(skip, default)]
     pub held_order: VecDeque<u8>,
 }
 
