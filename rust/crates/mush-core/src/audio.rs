@@ -32,7 +32,7 @@ use crate::{
     state::{
         audio::AudioDeviceSelection,
         drums::{get_bank, DrumState, DrumVoice},
-        synth::{midi_to_freq, GateMode, OscillatorState, SynthState, Waveform},
+        synth::{midi_to_freq, FxState, GateMode, OscillatorState, SynthState, Waveform},
         MAX_VOICES, NUM_DRUM_VOICES, NUM_STEPS,
     },
 };
@@ -44,7 +44,7 @@ const LIMIT_DRIVE: f32 = 2.0;      // Stronger saturation curve
 const OUTPUT_GAIN: f32 = 0.35;     // Reduced master output
 const SYNTH_BUS_GAIN: f32 = 0.55;  // Reduced synth
 const SAMPLE_BUS_GAIN: f32 = 0.55; // Sample bus independent from synth volume knob
-const DRUM_BUS_GAIN: f32 = 0.28;   // Drums post-synth-FX; bus still soft-limited
+const DRUM_BUS_GAIN: f32 = 0.28;   // Drums on own FX bus; summed with other buses then soft-limited
 const DRUM_VOICE_GAIN: f32 = 0.40; // Per-voice trim; kick multiplies by KICK_VOICE_GAIN_MUL
 const KICK_VOICE_GAIN_MUL: f32 = 1.52; // Extra fader path for kick vs other voices
 const KICK_ATTACK_MS: f32 = 2.8;   // Short enough for punch; tail fade handles cutoff
@@ -470,6 +470,81 @@ fn kick_sample_osc(
 
 const SAMPLE_POLY: usize = 8;
 
+/// Independent delay / reverb / warmth / air state for one summed bus (synth+loop, sample, drums).
+struct FxBusScratch {
+    warmth_z: f32,
+    air_z: f32,
+    delay_buf: Vec<f32>,
+    delay_idx: usize,
+    reverb: SimpleReverb,
+}
+
+impl FxBusScratch {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            warmth_z: 0.0,
+            air_z: 0.0,
+            delay_buf: vec![0.0; (sample_rate * 2.0) as usize],
+            delay_idx: 0,
+            reverb: SimpleReverb::new(sample_rate, 0.5, 0.3),
+        }
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.delay_buf.resize((sample_rate * 2.0) as usize, 0.0);
+        self.delay_idx = 0;
+        self.reverb = SimpleReverb::new(sample_rate, 0.5, 0.3);
+    }
+
+    fn process(&mut self, sample: f32, fx: &FxState, sample_rate: f32) -> f32 {
+        let sample = sample + DENORMAL_PREVENTION;
+
+        let drive = 1.0 + fx.drive * 8.0;
+        let driven = dsp::soft_limit(sample, drive, 1.0);
+
+        let warmed = if fx.warmth > 0.001 {
+            let warm_lp_coeff = 0.05 + fx.warmth * 0.15;
+            let lp_out = dsp::one_pole_lp(driven, &mut self.warmth_z, warm_lp_coeff);
+            driven * (1.0 - fx.warmth * 0.6) + lp_out * fx.warmth * 0.6
+        } else {
+            self.warmth_z *= 0.95;
+            driven
+        };
+
+        let air_boost = if fx.air > 0.001 {
+            let diff = warmed - self.air_z;
+            self.air_z = warmed;
+            warmed + diff * fx.air * 1.5
+        } else {
+            self.air_z = warmed;
+            warmed
+        };
+
+        let delay_out = if fx.delay_mix > 0.001 {
+            let delay_samples = ((0.08 + fx.delay_time * 1.92) * sample_rate) as usize;
+            let delay_samples = delay_samples.min(self.delay_buf.len().saturating_sub(1).max(1));
+            let read_idx =
+                (self.delay_idx + self.delay_buf.len() - delay_samples) % self.delay_buf.len();
+            let delayed = self.delay_buf[read_idx];
+
+            let feedback = fx.delay_feedback.min(MAX_FEEDBACK);
+            self.delay_buf[self.delay_idx] = dsp::soft_limit(
+                air_boost + delayed * feedback + DENORMAL_PREVENTION,
+                1.2,
+                1.0,
+            );
+            self.delay_idx = (self.delay_idx + 1) % self.delay_buf.len();
+
+            air_boost * (1.0 - fx.delay_mix) + delayed * fx.delay_mix
+        } else {
+            air_boost
+        };
+
+        self.reverb.set_params(fx.reverb, fx.reverb * 0.35);
+        self.reverb.process(delay_out)
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct SampleVoice {
     active: bool,
@@ -495,12 +570,9 @@ struct AudioEngine {
     _filter_z2: f32,  // Reserved for resonant filter (unused currently)
     current_cutoff: f32,      // Smoothed filter cutoff (prevents zipper noise)
     current_gain: f32,        // Smoothed gain (prevents zipper noise)
-    warmth_z: f32,   // Dedicated state for warmth FX filter
-    air_z: f32,      // Dedicated state for air FX differentiation
-    delay_buf: Vec<f32>,
-    delay_idx: usize,
-    // Improved reverb with allpass diffusers
-    reverb: SimpleReverb,
+    fx_synth: FxBusScratch,
+    fx_sample: FxBusScratch,
+    fx_drums: FxBusScratch,
     loop_buf: Vec<f32>,
     loop_len: usize,
     loop_write: usize,
@@ -554,11 +626,9 @@ impl AudioEngine {
             _filter_z2: 0.0,
             current_cutoff: 0.5,      // Start at mid-range cutoff
             current_gain: 0.7,        // Start at typical volume
-            warmth_z: 0.0,
-            air_z: 0.0,
-            delay_buf: vec![0.0; (sample_rate * 2.0) as usize], // 2 second max delay
-            delay_idx: 0,
-            reverb: SimpleReverb::new(sample_rate, 0.5, 0.3),
+            fx_synth: FxBusScratch::new(sample_rate),
+            fx_sample: FxBusScratch::new(sample_rate),
+            fx_drums: FxBusScratch::new(sample_rate),
             loop_buf: vec![0.0; (sample_rate as usize) * MAX_LOOP_SECONDS],
             loop_len: 0,
             loop_write: 0,
@@ -608,11 +678,9 @@ impl AudioEngine {
             return; // No change needed
         }
         self.sample_rate = sample_rate;
-        // Resize buffers for new sample rate
-        self.delay_buf.resize((sample_rate * 2.0) as usize, 0.0);
-        self.delay_idx = 0;
-        // Recreate reverb with new sample rate
-        self.reverb = SimpleReverb::new(sample_rate, 0.5, 0.3);
+        self.fx_synth.set_sample_rate(sample_rate);
+        self.fx_sample.set_sample_rate(sample_rate);
+        self.fx_drums.set_sample_rate(sample_rate);
         self.loop_buf.resize((sample_rate as usize) * MAX_LOOP_SECONDS, 0.0);
         self.sloop_buf.resize((sample_rate as usize) * MAX_LOOP_SECONDS, 0.0);
         // Update envelope coefficients
@@ -873,9 +941,16 @@ impl AudioEngine {
                 (sample_live[i] + sample_loop_out[i]) * SAMPLE_BUS_GAIN;
             // Keep scope reactive levels representative of full melodic bus.
             synth_samples[i] = synth_loop_bus + sample_bus;
-            // FX (drive/delay/reverb) on synth+loop only — sample/drums stay direct and avoid wash.
-            let wet_synth = self.apply_fx_sample(synth_loop_bus, &params.synth) + sample_bus;
-            let mut mixed = wet_synth + drum_out[i] * DRUM_BUS_GAIN;
+            let wet_synth = self.fx_synth.process(synth_loop_bus, &params.synth.fx, self.sample_rate);
+            let wet_sample = self
+                .fx_sample
+                .process(sample_bus, &params.sample.fx, self.sample_rate);
+            let wet_drums = self.fx_drums.process(
+                drum_out[i] * DRUM_BUS_GAIN,
+                &params.drums.fx,
+                self.sample_rate,
+            );
+            let mut mixed = wet_synth + wet_sample + wet_drums;
             // Continuous soft limiting - applied to ALL samples, no conditional
             mixed = dsp::soft_limit(mixed, LIMIT_DRIVE, LIMIT_CEILING) * OUTPUT_GAIN;
             // FINAL HARD CLAMP - absolutely prevent any sample from exceeding -1.0 to 1.0
@@ -1428,62 +1503,6 @@ impl AudioEngine {
         self.drum_noise ^= self.drum_noise >> 17;
         self.drum_noise ^= self.drum_noise << 5;
         ((self.drum_noise as f32 / u32::MAX as f32) * 2.0) - 1.0
-    }
-
-    fn apply_fx_sample(&mut self, sample: f32, synth: &SynthState) -> f32 {
-        // Add tiny DC offset to prevent denormals in feedback paths
-        let sample = sample + DENORMAL_PREVENTION;
-        
-        // Drive/saturation - continuous, always applied
-        let drive = 1.0 + synth.fx.drive * 8.0;
-        let driven = dsp::soft_limit(sample, drive, 1.0);
-
-        // Warmth: gentle lowpass coloration (uses dedicated warmth_z state)
-        let warmed = if synth.fx.warmth > 0.001 {
-            let warm_lp_coeff = 0.05 + synth.fx.warmth * 0.15;  // More pronounced effect
-            let lp_out = dsp::one_pole_lp(driven, &mut self.warmth_z, warm_lp_coeff);
-            // Blend between dry and filtered based on warmth amount
-            driven * (1.0 - synth.fx.warmth * 0.6) + lp_out * synth.fx.warmth * 0.6
-        } else {
-            // Decay filter state when not in use
-            self.warmth_z *= 0.95;
-            driven
-        };
-
-        // Air: high-frequency boost via differentiation (uses dedicated air_z state)
-        let air_boost = if synth.fx.air > 0.001 {
-            let diff = warmed - self.air_z;
-            self.air_z = warmed;
-            warmed + diff * synth.fx.air * 1.5  // More pronounced high-freq boost
-        } else {
-            self.air_z = warmed;
-            warmed
-        };
-        
-        // Delay with CLAMPED feedback to prevent oscillation
-        let delay_out = if synth.fx.delay_mix > 0.001 {
-            let delay_samples = ((0.08 + synth.fx.delay_time * 1.92) * self.sample_rate) as usize;
-            let delay_samples = delay_samples.min(self.delay_buf.len() - 1);
-            let read_idx = (self.delay_idx + self.delay_buf.len() - delay_samples) % self.delay_buf.len();
-            let delayed = self.delay_buf[read_idx];
-            
-            // Clamp feedback to prevent infinite oscillation and denormals
-            let feedback = synth.fx.delay_feedback.min(MAX_FEEDBACK);
-            self.delay_buf[self.delay_idx] = dsp::soft_limit(
-                air_boost + delayed * feedback + DENORMAL_PREVENTION,
-                1.2,
-                1.0,
-            );
-            self.delay_idx = (self.delay_idx + 1) % self.delay_buf.len();
-            
-            air_boost * (1.0 - synth.fx.delay_mix) + delayed * synth.fx.delay_mix
-        } else {
-            air_boost
-        };
-
-        // Reverb: proper comb + allpass (Freeverb-style)
-        self.reverb.set_params(synth.fx.reverb, synth.fx.reverb * 0.35);
-        self.reverb.process(delay_out)
     }
 
     fn update_recording(&mut self, recording: bool, out: &[f32]) {

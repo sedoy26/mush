@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::looper::LoopState;
+use super::{looper::LoopState, synth::FxState};
 
 /// Max capture length (seconds) — caps RAM and WAV size.
 pub const MAX_SAMPLE_SECONDS: f32 = 45.0;
@@ -44,6 +44,9 @@ pub struct SampleState {
     /// controls as synth loop (R/T/Y/P/U) when the Sample tab is focused. Saved as `.sampleloop.wav`.
     #[serde(default)]
     pub performance_loop: LoopState,
+    /// Per-bus drive / delay / warmth / air / reverb (independent from synth and drums).
+    #[serde(default)]
+    pub fx: FxState,
 }
 
 impl Default for SampleState {
@@ -62,6 +65,7 @@ impl Default for SampleState {
             release: 0.08,
             play_enabled: true,
             performance_loop: LoopState::default(),
+            fx: FxState::bus_defaults(),
         }
     }
 }

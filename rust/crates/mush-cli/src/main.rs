@@ -590,7 +590,7 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
         || key_matches_shifted_base_letter(&key, 'y')
         || key_matches_shifted_base_letter(&key, 'u');
 
-    if !loop_combo_ty_u {
+    if !loop_combo_ty_u && !shift_blocks_chromatic_for_fx_keys(&key) {
         if let Some(offset) = key_to_offset(&key.code) {
             // Only swallow key-repeat bursts for the *same* held key. Do not treat a fresh `Press`
             // as "already held" — many terminals omit `Release`, so `keyboard_note` can stay set.
@@ -614,6 +614,9 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
 
     let mut state = runtime.state.lock();
     if shared_navigation_keys(&mut state, ui, TabFocus::Synth, &key) {
+        return Ok(());
+    }
+    if try_shift_fx_keys(&mut state.synth.fx, &key) {
         return Ok(());
     }
     match key.code {
@@ -662,8 +665,19 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
         KeyCode::Char('p') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             state.synth.filter_on = !state.synth.filter_on
         }
-        KeyCode::Char('-') => state.synth.cutoff = (state.synth.cutoff - 0.03).clamp(0.0, 1.0),
-        KeyCode::Char('=') => state.synth.cutoff = (state.synth.cutoff + 0.03).clamp(0.0, 1.0),
+        // Cutoff: plain - / =. Resonance: _ / +, or Shift+- / Shift+= when the terminal sends '-'/'=' + Shift (Kitty).
+        KeyCode::Char('-') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.cutoff = (state.synth.cutoff - 0.03).clamp(0.0, 1.0)
+        }
+        KeyCode::Char('-') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.resonance = (state.synth.resonance - 0.03).clamp(0.0, 1.0)
+        }
+        KeyCode::Char('=') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.cutoff = (state.synth.cutoff + 0.03).clamp(0.0, 1.0)
+        }
+        KeyCode::Char('=') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.synth.resonance = (state.synth.resonance + 0.03).clamp(0.0, 1.0)
+        }
         KeyCode::Char('_') => {
             state.synth.resonance = (state.synth.resonance - 0.03).clamp(0.0, 1.0)
         }
@@ -728,33 +742,6 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
         KeyCode::Char('"') | KeyCode::Char('\'') => {
             state.synth.lfo_depth = (state.synth.lfo_depth + 0.03).clamp(0.0, 1.0)
         }
-        KeyCode::Char('D') => state.synth.fx.drive = (state.synth.fx.drive - 0.03).clamp(0.0, 1.0),
-        KeyCode::Char('F') => state.synth.fx.drive = (state.synth.fx.drive + 0.03).clamp(0.0, 1.0),
-        KeyCode::Char('J') => {
-            state.synth.fx.delay_mix = (state.synth.fx.delay_mix - 0.03).clamp(0.0, 1.0)
-        }
-        KeyCode::Char('K') => {
-            state.synth.fx.delay_mix = (state.synth.fx.delay_mix + 0.03).clamp(0.0, 1.0)
-        }
-        KeyCode::Char('N') => {
-            state.synth.fx.delay_feedback = (state.synth.fx.delay_feedback - 0.03).clamp(0.0, 1.0)
-        }
-        KeyCode::Char('M') => {
-            state.synth.fx.delay_feedback = (state.synth.fx.delay_feedback + 0.03).clamp(0.0, 1.0)
-        }
-        KeyCode::Char('V') => {
-            state.synth.fx.delay_time = (state.synth.fx.delay_time - 0.03).clamp(0.0, 1.0)
-        }
-        KeyCode::Char('B') => {
-            state.synth.fx.delay_time = (state.synth.fx.delay_time + 0.03).clamp(0.0, 1.0)
-        }
-        KeyCode::Char('W') => {
-            state.synth.fx.warmth = (state.synth.fx.warmth + 0.03).clamp(0.0, 1.0)
-        }
-        KeyCode::Char('A') => state.synth.fx.air = (state.synth.fx.air + 0.03).clamp(0.0, 1.0),
-        KeyCode::Char('E') => {
-            state.synth.fx.reverb = (state.synth.fx.reverb + 0.03).clamp(0.0, 1.0)
-        }
         _ if key_matches_shifted_base_letter(&key, 'r') => {
             if state.looper.recording {
                 state.looper.stop_recording();
@@ -780,7 +767,7 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
         _ if key_matches_shifted_base_letter(&key, 'u') => {
             state.looper.clear();
         }
-        // Drums chain: plain \ toggles list-play; | or Shift+\ appends current bank (terminals often send the latter as \\+Shift).
+        // Drums chain: plain \ toggles chain play-through; | or Shift+\ appends current bank (terminals often send the latter as \\+Shift).
         KeyCode::Char('|') => {
             let p = state.drums.current_pattern;
             state.drums.chain_push(p);
@@ -804,7 +791,7 @@ fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent
         || key_matches_shifted_base_letter(&key, 'y')
         || key_matches_shifted_base_letter(&key, 'u');
 
-    if !loop_combo_ty_u {
+    if !loop_combo_ty_u && !shift_blocks_chromatic_for_fx_keys(&key) {
         if let Some(offset) = key_to_offset(&key.code) {
             let is_same_key_autorepeat =
                 matches!(key.kind, KeyEventKind::Repeat) && ui.keyboard_note == Some(offset);
@@ -839,6 +826,9 @@ fn handle_sample_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent
 
     let mut state = runtime.state.lock();
     if shared_navigation_keys(&mut state, ui, TabFocus::Sample, &key) {
+        return Ok(());
+    }
+    if try_shift_fx_keys(&mut state.sample.fx, &key) {
         return Ok(());
     }
     match key.code {
@@ -1098,7 +1088,7 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
             apply_pattern(state, 1);
             set_notice(ui, "Starter B loaded into this pattern".to_string());
         }
-        // Plain 1-8: select which pattern bank is being edited (append banks to the list with | or Shift+\).
+        // Plain 1-8: select which pattern bank is being edited (append banks to the chain with | or Shift+\).
         KeyCode::Char(c @ '1'..='8') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             clear_confirm(ui);
             let idx = (c as u8 - b'1') as usize;
@@ -1134,20 +1124,20 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
             state.drums.current_pattern = (state.drums.current_pattern + 1).min(NUM_PATTERNS - 1);
             set_notice(ui, format!("Editing pattern {}", state.drums.current_pattern + 1));
         }
-        // Chain: plain \ toggles playing the bank list; | or Shift+\ appends current bank (many terminals emit Shift+\ as \\ + Shift).
+        // Chain: plain \ toggles chain play-through; | or Shift+\ appends current bank (many terminals emit Shift+\ as \\ + Shift).
         KeyCode::Char('|') => {
             clear_confirm(ui);
             state.drums.chain_push(state.drums.current_pattern);
-            set_notice(ui, format!("Added bank {} to list (len={})", state.drums.current_pattern + 1, state.drums.chain.len()));
+            set_notice(ui, format!("Added bank {} to chain (len={})", state.drums.current_pattern + 1, state.drums.chain.len()));
         }
         KeyCode::Char('\\') => {
             clear_confirm(ui);
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 state.drums.chain_push(state.drums.current_pattern);
-                set_notice(ui, format!("Added bank {} to list (len={})", state.drums.current_pattern + 1, state.drums.chain.len()));
+                set_notice(ui, format!("Added bank {} to chain (len={})", state.drums.current_pattern + 1, state.drums.chain.len()));
             } else {
                 state.drums.chain_mode = !state.drums.chain_mode;
-                set_notice(ui, format!("Play pattern list {}", if state.drums.chain_mode { "ON" } else { "OFF" }));
+                set_notice(ui, format!("Chain play-through {}", if state.drums.chain_mode { "ON" } else { "OFF" }));
             }
         }
         // Backspace removes last pattern from chain
@@ -1180,6 +1170,9 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
                 state.drums.copy_pattern_to(dest);
                 set_notice(ui, format!("Copied pattern {} to {}", state.drums.current_pattern + 1, dest + 1));
             }
+        }
+        _ if try_shift_fx_keys(&mut state.drums.fx, &key) => {
+            clear_confirm(ui);
         }
         _ => {}
     }
@@ -1453,6 +1446,36 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         UiStyle::Value,
     );
 
+    // FX section - row 15: three independent FX buses (Shift+DF… keys edit the focused tab)
+    canvas.text_style(left_x + 2, 15, "Bus", UiStyle::Label);
+    let mut col = left_x + 7;
+    for (label, focus) in [
+        ("SYN", TabFocus::Synth),
+        ("SMP", TabFocus::Sample),
+        ("DRM", TabFocus::Drums),
+    ] {
+        let active = state.ui.tab_focus == focus;
+        let seg = if active {
+            format!("[{}]", label)
+        } else {
+            format!(" {} ", label)
+        };
+        let w = seg.chars().count();
+        canvas.text_style(
+            col,
+            15,
+            &seg,
+            if active { UiStyle::Active } else { UiStyle::Hint },
+        );
+        col += w;
+    }
+
+    let fx_active = match state.ui.tab_focus {
+        TabFocus::Synth => &state.synth.fx,
+        TabFocus::Sample => &state.sample.fx,
+        TabFocus::Drums => &state.drums.fx,
+    };
+
     // FX section - row 16: Attack and Release
     canvas.text_style(left_x + 2, 16, "Atk", UiStyle::Label);
     canvas.text_style(left_x + 6, 16, &format!("{:.3}s", state.synth.attack), UiStyle::Value);
@@ -1513,24 +1536,27 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         if state.synth.filter_on { UiStyle::Filter } else { UiStyle::Value },
     );
 
-    // FX section - row 21: Drive and Delay
+    // FX section - row 21: Drive and Delay (values follow focused tab bus)
     canvas.text_style(left_x + 2, 21, "Drv", UiStyle::Label);
-    canvas.text_style(left_x + 6, 21, &format!("{:.2}", state.synth.fx.drive), UiStyle::Value);
+    canvas.text_style(left_x + 6, 21, &format!("{:.2}", fx_active.drive), UiStyle::Value);
     canvas.text_style(left_x + 11, 21, "Dly", UiStyle::Label);
     canvas.text_style(
         left_x + 15,
         21,
-        &format!("{:.1}/{:.1}/{:.1}", state.synth.fx.delay_mix, state.synth.fx.delay_feedback, state.synth.fx.delay_time),
+        &format!(
+            "{:.1}/{:.1}/{:.1}",
+            fx_active.delay_mix, fx_active.delay_feedback, fx_active.delay_time
+        ),
         UiStyle::Value,
     );
 
     // FX section - row 22: Warmth, Air, Reverb
     canvas.text_style(left_x + 2, 22, "Wrm", UiStyle::Label);
-    canvas.text_style(left_x + 6, 22, &format!("{:.2}", state.synth.fx.warmth), UiStyle::Value);
+    canvas.text_style(left_x + 6, 22, &format!("{:.2}", fx_active.warmth), UiStyle::Value);
     canvas.text_style(left_x + 11, 22, "Air", UiStyle::Label);
-    canvas.text_style(left_x + 15, 22, &format!("{:.2}", state.synth.fx.air), UiStyle::Value);
+    canvas.text_style(left_x + 15, 22, &format!("{:.2}", fx_active.air), UiStyle::Value);
     canvas.text_style(left_x + 20, 22, "Rev", UiStyle::Label);
-    canvas.text_style(left_x + 24, 22, &format!("{:.2}", state.synth.fx.reverb), UiStyle::Value);
+    canvas.text_style(left_x + 24, 22, &format!("{:.2}", fx_active.reverb), UiStyle::Value);
 
     // SAMPLE panel (full edit: Settings S → MAIN below Reverb)
     let smp_inner = left_w.saturating_sub(4).max(8);
@@ -1653,8 +1679,8 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         );
     }
 
-    // SONG section - chain sequence (plain \ = list-play on/off; | or Shift+\ = append bank)
-    canvas.text_style(left_x + 2, song_top + 2, "LIST", UiStyle::Label);
+    // SONG section - chain sequence (plain \ = chain play on/off; | or Shift+\ = append bank)
+    canvas.text_style(left_x + 2, song_top + 2, "CHAIN", UiStyle::Label);
     canvas.text_style(
         left_x + 8,
         song_top + 2,
@@ -1662,7 +1688,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         if state.drums.chain_mode { UiStyle::Active } else { UiStyle::Hint },
     );
     // Display chain sequence (fits in remaining width)
-    let chain_display_width = left_w.saturating_sub(18);
+    let chain_display_width = left_w.saturating_sub(19);
     let chain_str: String = if state.drums.chain.is_empty() {
         "-- empty --".to_string()
     } else {
@@ -1679,7 +1705,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
             .join("→")
     };
     canvas.text_style(
-        left_x + 13,
+        left_x + 14,
         song_top + 2,
         &short_label(&chain_str, chain_display_width),
         UiStyle::Value,
@@ -1689,7 +1715,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(
         left_x + 2,
         song_top + 3,
-        &short_label("1-8 bank  Sh+1/2 fill  {/}  | add  BS pop  Del clr  \\ list", left_w.saturating_sub(4)),
+        &short_label("1-8 bank  Sh+1/2 fill  \\ |  Del clr  \\ chain", left_w.saturating_sub(4)),
         UiStyle::Hint,
     );
 
@@ -1901,7 +1927,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     } else if matches!(state.ui.tab_focus, TabFocus::Sample) {
         "TAB | ←→ tune ±½st ↑↓ gain | a..k notes | R/T/Y/P/U loop | Sh+G WAV | S settings (Smp root)".to_string()
     } else {
-        "TAB | ←→ step ↑↓ voice | [ ] vol | SPC | r run | Sh+G WAV | , . BPM | { } pat | S settings".to_string()
+        "TAB | ←→ step ↑↓ voice | [ [] ] vol | SPC | r run | Sh+G WAV | , . BPM | { } pat | S settings".to_string()
     };
     canvas.text(5, footer_y, &footer);
 
@@ -2249,6 +2275,71 @@ impl Default for UiLocalState {
 
 /// `Shift+S` as `Char('S')` (legacy) or `Char('s')` + [`KeyModifiers::SHIFT`] (Kitty
 /// `REPORT_ALL_KEYS_AS_ESCAPE_CODES`). Plain `s` / `h` must not match.
+/// Shift+letters used for drive/delay/warmth/air/reverb must not fire chromatic note-ons.
+fn shift_blocks_chromatic_for_fx_keys(key: &KeyEvent) -> bool {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    let c = match &key.code {
+        KeyCode::Char(ch) if ch.is_ascii_alphabetic() => ch.to_ascii_lowercase(),
+        _ => return false,
+    };
+    matches!(
+        c,
+        'd' | 'f' | 'j' | 'k' | 'n' | 'm' | 'v' | 'b' | 'w' | 'a' | 'e'
+    )
+}
+
+fn try_shift_fx_keys(fx: &mut mush_core::state::synth::FxState, key: &KeyEvent) -> bool {
+    match () {
+        _ if key_matches_shifted_base_letter(key, 'd') => {
+            fx.drive = (fx.drive - 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'f') => {
+            fx.drive = (fx.drive + 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'j') => {
+            fx.delay_mix = (fx.delay_mix - 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'k') => {
+            fx.delay_mix = (fx.delay_mix + 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'n') => {
+            fx.delay_feedback = (fx.delay_feedback - 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'm') => {
+            fx.delay_feedback = (fx.delay_feedback + 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'v') => {
+            fx.delay_time = (fx.delay_time - 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'b') => {
+            fx.delay_time = (fx.delay_time + 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'w') => {
+            fx.warmth = (fx.warmth + 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'a') => {
+            fx.air = (fx.air + 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ if key_matches_shifted_base_letter(key, 'e') => {
+            fx.reverb = (fx.reverb + 0.03).clamp(0.0, 1.0);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn key_matches_shifted_base_letter(key: &KeyEvent, base: char) -> bool {
     let lo = base.to_ascii_lowercase();
     let hi = base.to_ascii_uppercase();
@@ -2487,7 +2578,7 @@ fn build_help_paint_rows(inner_w: usize) -> Vec<HelpPaintRow> {
                     "[↑] [↓]",
                     "Volume: synth / sample gain. Drums: move voice (instrument row).",
                 ),
-                ("[[ ] []]", "Drums: row volume down / up."),
+                ("[ [] ]", "Drums: row volume down / up."),
                 ("[SPC]", "Release held note (synth/sample)."),
             ],
         ),
@@ -2514,13 +2605,16 @@ fn build_help_paint_rows(inner_w: usize) -> Vec<HelpPaintRow> {
                 ("[,] [.] [;] [']", "LFO rate and depth."),
                 (
                     "[p] [-] [=] [_] [+]",
-                    "Plain p: filter on/off. [-] [=] cutoff, [_] [+] resonance. Shift+P is loop play (Synth/Sample).",
+                    "Plain p: filter on/off. [-] [=] cutoff; [_] [+] or Shift+- / Shift+= resonance. Shift+P is loop play (Synth/Sample).",
                 ),
                 (
-                    "[D] [F] [J] [K] [N] [M] [V] [B]",
-                    "Drive, delay, feedback, time.",
+                    "[Shift+D F J K N M V B]",
+                    "Drive / delay mix / feedback / time on the current-tab FX bus (synth, sample, or drums).",
                 ),
-                ("[W] [A] [E]", "Warmth, air, reverb."),
+                (
+                    "[Shift+W A E]",
+                    "Warmth, air, reverb (+ only) on the current tab bus.",
+                ),
                 (
                     "[S] MAIN ↓ past Rev",
                     "Sample: record from SOUND-tab input, trim, keys+MIDI when Play ON.",
@@ -2540,11 +2634,15 @@ fn build_help_paint_rows(inner_w: usize) -> Vec<HelpPaintRow> {
                 ),
                 (
                     "[Drums]",
-                    "←→ step, ↑↓ voice, [ ] row volume.",
+                    "←→ step, ↑↓ voice, [ [] ] row volume.",
                 ),
                 (
                     "[\\] [|]",
-                    "Drums: \\ toggles play-through-pattern-list; | or Shift+\\ appends current bank to that list.",
+                    "Drums: \\ toggles chain play-through (patterns in order); | or Shift+\\ appends the current bank to the chain.",
+                ),
+                (
+                    "[Backspace] [Delete]",
+                    "Drums: Backspace removes the last pattern from the chain; Delete clears the whole chain.",
                 ),
                 (
                     "[SPC] [r] [c] [X] [1-8] [Sh+1/2]",
@@ -2623,7 +2721,7 @@ fn draw_help_overlay(
     canvas.text_clipped(
         x + 2,
         y + 1,
-        &short_label("Terminal synth + drums + looper", inner_w),
+        &short_label("Terminal based music production center", inner_w),
         UiStyle::Backdrop,
         max_x,
     );

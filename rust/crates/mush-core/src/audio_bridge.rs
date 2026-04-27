@@ -21,7 +21,7 @@ use crate::state::{
     drums::DrumState,
     looper::LoopState,
     sample::SampleState,
-    synth::SynthState,
+    synth::{FxState, SynthState},
 };
 
 /// Parameters snapshot for the audio thread.
@@ -51,6 +51,7 @@ pub struct SampleParams {
     pub play_enabled: bool,
     /// Sample-tab performance loop (same fields as main looper; separate buffer on audio thread).
     pub sample_loop: LooperParams,
+    pub fx: FxState,
 }
 
 impl Default for SampleParams {
@@ -68,6 +69,7 @@ impl Default for SampleParams {
             release: 0.08,
             play_enabled: true,
             sample_loop: LooperParams::default(),
+            fx: FxState::bus_defaults(),
         }
     }
 }
@@ -87,6 +89,7 @@ impl From<&SampleState> for SampleParams {
             release: s.release,
             play_enabled: s.play_enabled,
             sample_loop: LooperParams::from(&s.performance_loop),
+            fx: s.fx,
         }
     }
 }

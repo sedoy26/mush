@@ -161,7 +161,7 @@ impl Default for OscillatorState {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FxState {
     #[serde(alias = "fx_drive")]
@@ -178,6 +178,27 @@ pub struct FxState {
     pub air: f32,
     #[serde(alias = "fx_reverb")]
     pub reverb: f32,
+}
+
+impl Default for FxState {
+    fn default() -> Self {
+        Self::bus_defaults()
+    }
+}
+
+impl FxState {
+    /// Baseline FX for a bus (matches `SynthState::default().fx`).
+    pub fn bus_defaults() -> Self {
+        Self {
+            drive: 0.0,
+            delay_mix: 0.0,
+            delay_feedback: 0.2,
+            delay_time: 0.25,
+            warmth: 0.0,
+            air: 0.0,
+            reverb: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -289,15 +310,7 @@ impl Default for SynthState {
             active_osc: 0,
             voices: 1,
             freq_current: midi_to_freq(60),
-            fx: FxState {
-                drive: 0.0,
-                delay_mix: 0.0,
-                delay_feedback: 0.2,
-                delay_time: 0.25,
-                warmth: 0.0,
-                air: 0.0,
-                reverb: 0.0,
-            },
+            fx: FxState::bus_defaults(),
             filter_mix: 0.0,
             filt_z: 0.0,
             filt_z2: 0.0,

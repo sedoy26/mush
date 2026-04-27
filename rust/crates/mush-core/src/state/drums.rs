@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{NUM_DRUM_VOICES, NUM_PATTERNS, NUM_STEPS, MAX_CHAIN_LENGTH};
+use super::{synth::FxState, NUM_DRUM_VOICES, NUM_PATTERNS, NUM_STEPS, MAX_CHAIN_LENGTH};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DrumVoice {
@@ -340,6 +340,9 @@ pub struct DrumState {
     /// Whether chain mode is active (vs single pattern loop)
     #[serde(default)]
     pub chain_mode: bool,
+    /// Per-bus drive / delay / warmth / air / reverb (independent from synth and sample).
+    #[serde(default)]
+    pub fx: FxState,
 }
 
 impl DrumState {
@@ -451,6 +454,7 @@ impl Default for DrumState {
             chain: Vec::new(),
             chain_position: 0,
             chain_mode: false,
+            fx: FxState::bus_defaults(),
         }
     }
 }
