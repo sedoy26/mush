@@ -24,7 +24,11 @@ pub struct Donut {
     a: f32, // Rotation around X
     b: f32, // Rotation around Z
     r1: f32, // Tube radius
-    r2: f32, // Torus radius
+    r2: f32, // Torus major radius (base)
+    /// Major radius used for drawing this frame (base + kick * kick_swell), updated in tick.
+    r2_draw: f32,
+    /// How much `r2` grows when kick envelope is hot (VISUALS: Kick swell).
+    kick_swell: f32,
     a_speed: f32,
     b_speed: f32,
     k1: f32, // Screen scaling
@@ -36,11 +40,14 @@ pub struct Donut {
 
 impl Donut {
     pub fn new(seed: u64) -> Self {
+        let r2 = 2.0;
         Self {
             a: 0.0,
             b: 0.0,
             r1: 1.0,
-            r2: 2.0,
+            r2,
+            r2_draw: r2,
+            kick_swell: 0.45,
             a_speed: 1.0,
             b_speed: 0.5,
             k1: 30.0,
@@ -63,6 +70,16 @@ impl Donut {
                 label: "Torus Rad",
                 kind: ParamKind::Float { min: 1.0, max: 4.0, step: 0.1 },
                 default: ParamValue::Float(2.0),
+            },
+            ParamSpec {
+                key: "kick_swell",
+                label: "Kick swell",
+                kind: ParamKind::Float {
+                    min: 0.0,
+                    max: 1.8,
+                    step: 0.05,
+                },
+                default: ParamValue::Float(0.45),
             },
             ParamSpec {
                 key: "a_speed",
@@ -103,6 +120,15 @@ impl Visual for Donut {
             "r2" => {
                 if let ParamValue::Float(v) = value {
                     self.r2 = v.clamp(1.0, 4.0);
+                    self.r2_draw = self.r2;
+                    Ok(())
+                } else {
+                    Err(ParamError::type_mismatch(key, "float"))
+                }
+            }
+            "kick_swell" => {
+                if let ParamValue::Float(v) = value {
+                    self.kick_swell = v.clamp(0.0, 1.8);
                     Ok(())
                 } else {
                     Err(ParamError::type_mismatch(key, "float"))
@@ -132,6 +158,7 @@ impl Visual for Donut {
         match key {
             "r1" => Some(ParamValue::Float(self.r1)),
             "r2" => Some(ParamValue::Float(self.r2)),
+            "kick_swell" => Some(ParamValue::Float(self.kick_swell)),
             "a_speed" => Some(ParamValue::Float(self.a_speed)),
             "b_speed" => Some(ParamValue::Float(self.b_speed)),
             _ => None,
@@ -143,6 +170,9 @@ impl Visual for Donut {
         let speed_mod = 1.0 + reactive.master * 0.3 + reactive.kick * 0.5 + reactive.snare * 0.3;
         self.a += dt * self.a_speed * speed_mod;
         self.b += dt * self.b_speed * speed_mod;
+        // Torus major radius swells on kick (amount set via "Kick swell" / kick_swell param).
+        let kick = reactive.kick.clamp(0.0, 1.0);
+        self.r2_draw = (self.r2 + kick * self.kick_swell).clamp(1.0, 6.0);
     }
 
     fn render(&self, fb: &mut Framebuffer) {
@@ -198,8 +228,8 @@ impl Visual for Donut {
                 // y = (R2 + R1*cos(theta)) * sin(phi) 
                 // z = R1 * sin(theta)
 
-                let x = (self.r2 + self.r1 * cos_theta) * cos_phi;
-                let y = (self.r2 + self.r1 * cos_theta) * sin_phi;
+                let x = (self.r2_draw + self.r1 * cos_theta) * cos_phi;
+                let y = (self.r2_draw + self.r1 * cos_theta) * sin_phi;
                 let z = self.r1 * sin_theta;
 
                 // Rotate around X by A
@@ -273,6 +303,7 @@ impl Visual for Donut {
     fn reset(&mut self) {
         self.a = 0.0;
         self.b = 0.0;
+        self.r2_draw = self.r2;
     }
 
     fn set_base_color(&mut self, r: u8, g: u8, b: u8) {

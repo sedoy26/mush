@@ -85,6 +85,7 @@ impl VisualMode {
             VisualMode::Cube => "Cube",
         }
     }
+
 }
 
 #[derive(Deserialize)]
@@ -244,9 +245,30 @@ pub struct UiState {
     pub visual_fx: VisualFx,
     #[serde(alias = "camera_reactivity")]
     pub visual_fx_depth: f32,
+    /// Donut only: how much the torus major radius grows on kick (VISUALS tab "Kick swell").
+    #[serde(default = "default_donut_kick_swell")]
+    pub donut_kick_swell: f32,
+    /// Cube: extra scale on kick (VISUALS "Kick punch").
+    #[serde(default = "default_cube_kick_punch")]
+    pub cube_kick_punch: f32,
+    /// Cube: counter-rotation on hi-hat (VISUALS "Hat rewind").
+    #[serde(default = "default_cube_hat_rewind")]
+    pub cube_hat_rewind: f32,
     pub scope_show_drums: bool,
     #[serde(default)]
     pub tab_focus: TabFocus,
+}
+
+fn default_donut_kick_swell() -> f32 {
+    0.45
+}
+
+fn default_cube_kick_punch() -> f32 {
+    0.55
+}
+
+fn default_cube_hat_rewind() -> f32 {
+    0.4
 }
 
 impl Default for UiState {
@@ -259,6 +281,9 @@ impl Default for UiState {
             visual_mode: VisualMode::Scope,
             visual_fx: VisualFx::Off,
             visual_fx_depth: 0.85,
+            donut_kick_swell: default_donut_kick_swell(),
+            cube_kick_punch: default_cube_kick_punch(),
+            cube_hat_rewind: default_cube_hat_rewind(),
             scope_show_drums: true,
             tab_focus: TabFocus::default(),
         }

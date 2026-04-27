@@ -24,8 +24,7 @@ use mush_core::state::{
     ui::{SettingsPage, TabFocus, Theme, VisualFx, VisualMode},
     AppState, MAX_VOICES, NUM_PATTERNS, NUM_STEPS,
 };
-use mush_core::visuals::{Framebuffer, VisualRegistry};
-use mush_core::camera::apply_visual_fx;
+use mush_core::visuals::{Framebuffer, ParamValue, VisualRegistry};
 use mush_core::Runtime;
 
 const INPUT_POLL_MS: u64 = 16;
@@ -1747,24 +1746,17 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
                 // Set theme-based base color for effects that use it
                 let (r, g, b) = theme_rgb(state.ui.theme);
                 v.set_base_color(r, g, b);
+                if matches!(state.ui.visual_mode, VisualMode::Donut) {
+                    let _ = v.set_param("kick_swell", ParamValue::Float(state.ui.donut_kick_swell));
+                }
+                if matches!(state.ui.visual_mode, VisualMode::Cube) {
+                    let _ = v.set_param("kick_punch", ParamValue::Float(state.ui.cube_kick_punch));
+                    let _ = v.set_param("hat_rewind", ParamValue::Float(state.ui.cube_hat_rewind));
+                }
                 v.tick(1.0 / 60.0, &state.audio.reactive);
                 v.render(&mut ui.visual_fb);
             }
-            
-            // Skip expensive FX post-processing when settings/help covers the area
-            // (the base visual still renders, but FX is skipped for performance)
-            let fx_enabled = !matches!(state.ui.visual_fx, VisualFx::Off) 
-                && !state.ui.settings_open 
-                && !state.ui.help_open;
-            if fx_enabled {
-                let fx = state.ui.visual_fx;
-                let depth = state.ui.visual_fx_depth;
-                let reactive = state.audio.reactive.clone();
-                ui.visual_fb.apply_brightness_fx(|value, x, y, w, h| {
-                    apply_visual_fx(value, x, y, w, h, fx, depth, &reactive)
-                });
-            }
-            
+
             // Store colored lines for overlay (preserves per-char colors)
             ui.visual_colored_lines = ui.visual_fb.to_colored_strings();
             ui.visual_pos = (right_x + 1, 3);
@@ -2395,8 +2387,11 @@ fn settings_row_count(page: SettingsPage, visual_mode: VisualMode) -> usize {
     match page {
         SettingsPage::Main => 22,
         SettingsPage::Visuals => match visual_mode {
-            VisualMode::Scope => 2,   // Visual + Drums scope
-            _ => 3,                   // Visual + FX Style + FX Depth (all framebuffer visuals)
+            VisualMode::Scope => 2,
+            VisualMode::Donut => 2,
+            VisualMode::Cube => 3,
+            VisualMode::Camera => 3,
+            _ => 1,
         },
         SettingsPage::Project => 4,
         SettingsPage::SoundDevice => 4,
@@ -2836,11 +2831,27 @@ fn settings_lines(state: &AppState, ui: &UiLocalState) -> Vec<String> {
                         ),
                     ));
                 }
-                _ => {
-                    // All framebuffer visuals get FX Style + FX Depth
+                VisualMode::Donut => {
+                    rows.push(selected(
+                        1,
+                        format!("Kick swell {:.2}  [←→]", state.ui.donut_kick_swell),
+                    ));
+                }
+                VisualMode::Cube => {
+                    rows.push(selected(
+                        1,
+                        format!("Kick punch {:.2}  [←→]", state.ui.cube_kick_punch),
+                    ));
+                    rows.push(selected(
+                        2,
+                        format!("Hat rewind {:.2}  [←→]", state.ui.cube_hat_rewind),
+                    ));
+                }
+                VisualMode::Camera => {
                     rows.push(selected(1, format!("FX Style   {:?}", state.ui.visual_fx)));
                     rows.push(selected(2, format!("FX Depth   {:.2}", state.ui.visual_fx_depth)));
                 }
+                _ => {}
             }
             rows
         }
@@ -3051,14 +3062,30 @@ fn adjust_setting(runtime: &mut Runtime, ui: &mut UiLocalState, delta: i32) -> R
             }
             1 => match state.ui.visual_mode {
                 VisualMode::Scope => state.ui.scope_show_drums = !state.ui.scope_show_drums,
-                _ => state.ui.visual_fx = cycle_visual_fx(state.ui.visual_fx, delta),
-            },
-            2 => {
-                if !matches!(state.ui.visual_mode, VisualMode::Scope) {
-                    state.ui.visual_fx_depth =
-                        (state.ui.visual_fx_depth + delta as f32 * 0.05).clamp(0.0, 1.0)
+                VisualMode::Donut => {
+                    state.ui.donut_kick_swell =
+                        (state.ui.donut_kick_swell + delta as f32 * 0.04).clamp(0.0, 1.8);
                 }
-            }
+                VisualMode::Cube => {
+                    state.ui.cube_kick_punch =
+                        (state.ui.cube_kick_punch + delta as f32 * 0.04).clamp(0.0, 2.0);
+                }
+                VisualMode::Camera => {
+                    state.ui.visual_fx = cycle_visual_fx(state.ui.visual_fx, delta);
+                }
+                _ => {}
+            },
+            2 => match state.ui.visual_mode {
+                VisualMode::Cube => {
+                    state.ui.cube_hat_rewind =
+                        (state.ui.cube_hat_rewind + delta as f32 * 0.04).clamp(0.0, 1.5);
+                }
+                VisualMode::Camera => {
+                    state.ui.visual_fx_depth =
+                        (state.ui.visual_fx_depth + delta as f32 * 0.05).clamp(0.0, 1.0);
+                }
+                _ => {}
+            },
             _ => {}
         },
         SettingsPage::Project => {

@@ -22,6 +22,14 @@ pub struct Cube {
     perspective: f32,
     palette_idx: usize,
     palette: [Color; 256],
+    /// Extra scale from kick (`kick_punch` × kick level), updated in tick.
+    kick_size_mul: f32,
+    /// Counter-rotation from hi-hat (`hat_rewind` × hat level), radians offset to `time`, updated in tick.
+    hat_phase_drag: f32,
+    /// Max extra scale at full kick (VISUALS "Kick punch").
+    kick_punch: f32,
+    /// How strongly hi-hats pull rotation backward (VISUALS "Hat rewind").
+    hat_rewind: f32,
     #[allow(dead_code)]
     rng: SmallRng,
 }
@@ -35,12 +43,36 @@ impl Cube {
             perspective: 3.0,
             palette_idx: 3, // matrix
             palette: palette::matrix_green(),
+            kick_size_mul: 1.0,
+            hat_phase_drag: 0.0,
+            kick_punch: 0.55,
+            hat_rewind: 0.4,
             rng: SmallRng::seed_from_u64(seed),
         }
     }
 
     fn params_list() -> &'static [ParamSpec] {
         static PARAMS: &[ParamSpec] = &[
+            ParamSpec {
+                key: "kick_punch",
+                label: "Kick punch",
+                kind: ParamKind::Float {
+                    min: 0.0,
+                    max: 2.0,
+                    step: 0.05,
+                },
+                default: ParamValue::Float(0.55),
+            },
+            ParamSpec {
+                key: "hat_rewind",
+                label: "Hat rewind",
+                kind: ParamKind::Float {
+                    min: 0.0,
+                    max: 1.5,
+                    step: 0.05,
+                },
+                default: ParamValue::Float(0.4),
+            },
             ParamSpec {
                 key: "speed",
                 label: "Speed",
@@ -117,6 +149,22 @@ impl Visual for Cube {
 
     fn set_param(&mut self, key: &str, value: ParamValue) -> Result<(), ParamError> {
         match key {
+            "kick_punch" => {
+                if let ParamValue::Float(v) = value {
+                    self.kick_punch = v.clamp(0.0, 2.0);
+                    Ok(())
+                } else {
+                    Err(ParamError::type_mismatch(key, "float"))
+                }
+            }
+            "hat_rewind" => {
+                if let ParamValue::Float(v) = value {
+                    self.hat_rewind = v.clamp(0.0, 1.5);
+                    Ok(())
+                } else {
+                    Err(ParamError::type_mismatch(key, "float"))
+                }
+            }
             "speed" => {
                 if let ParamValue::Float(v) = value {
                     self.rotation_speed = v.clamp(0.1, 3.0);
@@ -160,6 +208,8 @@ impl Visual for Cube {
 
     fn get_param(&self, key: &str) -> Option<ParamValue> {
         match key {
+            "kick_punch" => Some(ParamValue::Float(self.kick_punch)),
+            "hat_rewind" => Some(ParamValue::Float(self.hat_rewind)),
             "speed" => Some(ParamValue::Float(self.rotation_speed)),
             "size" => Some(ParamValue::Float(self.size)),
             "perspective" => Some(ParamValue::Float(self.perspective)),
@@ -171,6 +221,11 @@ impl Visual for Cube {
     fn tick(&mut self, dt: f32, reactive: &ReactiveLevels) {
         let speed_mod = 0.5 + reactive.master * 1.5;
         self.time += dt * self.rotation_speed * speed_mod;
+        let kick = reactive.kick.clamp(0.0, 1.0);
+        self.kick_size_mul = (1.0 + kick * self.kick_punch).clamp(0.35, 4.0);
+        let hat = reactive.hat.clamp(0.0, 1.0);
+        // Pull rotation backward on hi-hat (scaled radians; applied in render via `time` offset).
+        self.hat_phase_drag = -hat * self.hat_rewind * 0.55;
     }
 
     fn render(&self, fb: &mut Framebuffer) {
@@ -181,8 +236,8 @@ impl Visual for Cube {
 
         fb.clear();
 
-        // Scale cube by size parameter
-        let s = self.size;
+        // Scale cube by size parameter × kick-driven swell
+        let s = self.size * self.kick_size_mul;
         let vertices: [[f32; 3]; 8] = [
             [-s, -s, -s],
             [s, -s, -s],
@@ -201,10 +256,11 @@ impl Visual for Cube {
             (0, 4), (1, 5), (2, 6), (3, 7), // Connecting edges
         ];
 
-        // Rotation angles
-        let rot_x = self.time;
-        let rot_y = self.time * 0.7;
-        let rot_z = self.time * 0.5;
+        // Rotation angles (hi-hat pulls phase backward)
+        let t = self.time + self.hat_phase_drag;
+        let rot_x = t;
+        let rot_y = t * 0.7;
+        let rot_z = t * 0.5;
 
         let cos_x = rot_x.cos();
         let sin_x = rot_x.sin();
@@ -257,7 +313,7 @@ impl Visual for Cube {
             let (i, j) = EDGES[edge_idx];
             if let (Some((x1, y1)), Some((x2, y2))) = (project(rotated[i]), project(rotated[j])) {
                 // Color varies by depth
-                let depth_norm = ((depth + self.size) / (2.0 * self.size)).clamp(0.0, 1.0);
+                let depth_norm = ((depth + s) / (2.0 * s)).clamp(0.0, 1.0);
                 let color_idx = (depth_norm * 200.0) as usize + 55;
                 let color = self.palette[color_idx.min(255)];
                 self.draw_line(fb, x1, y1, x2, y2, color);
@@ -267,6 +323,8 @@ impl Visual for Cube {
 
     fn reset(&mut self) {
         self.time = 0.0;
+        self.kick_size_mul = 1.0;
+        self.hat_phase_drag = 0.0;
     }
 }
 
