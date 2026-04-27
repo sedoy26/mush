@@ -1,5 +1,6 @@
 AGENTS.md
 .DS_Store
+rust/target/
 wav/*
 !wav/demo.wav
 projects/*

@@ -42,3 +42,31 @@ impl AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_note_updates_state() {
+        let mut state = AppState::default();
+        state.synth.key_offset = Some(7);
+        state.synth.key_note_on = true;
+        assert_eq!(state.synth.current_play_midi(), 67);
+        state.synth.key_note_on = false;
+        state.synth.key_offset = None;
+        assert_eq!(state.synth.current_play_midi(), 60);
+        assert!(!state.synth.key_note_on);
+    }
+
+    #[test]
+    fn loop_replace_clears_previous_state() {
+        let mut state = AppState::default();
+        state.looper.has_audio = true;
+        state.looper.playing = true;
+        state.looper.begin_replace();
+        assert!(state.looper.recording);
+        assert!(!state.looper.has_audio);
+        assert!(!state.looper.playing);
+    }
+}
