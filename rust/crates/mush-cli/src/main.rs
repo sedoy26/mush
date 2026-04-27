@@ -409,6 +409,15 @@ fn handle_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent) -> Re
         if new_state {
             state.ui.help_open = false;
             ui.help_scroll = 0;
+            state.project.available =
+                mush_core::project_io::list_projects(runtime.base_dir()).unwrap_or_default();
+            if state.project.available.is_empty() {
+                ui.project_index = 0;
+            } else {
+                ui.project_index =
+                    ui.project_index
+                        .min(state.project.available.len().saturating_sub(1));
+            }
         }
         return Ok(false);
     }
@@ -772,13 +781,18 @@ fn handle_synth_key(runtime: &mut Runtime, ui: &mut UiLocalState, key: KeyEvent)
         _ if key_matches_shifted_base_letter(&key, 'u') => {
             state.looper.clear();
         }
-        // Chain mode toggle (available in synth mode too)
-        KeyCode::Char('\\') => {
-            state.drums.chain_mode = !state.drums.chain_mode;
-        }
+        // Drums chain: plain \ toggles list-play; | or Shift+\ appends current bank (terminals often send the latter as \\+Shift).
         KeyCode::Char('|') => {
             let p = state.drums.current_pattern;
             state.drums.chain_push(p);
+        }
+        KeyCode::Char('\\') => {
+            let p = state.drums.current_pattern;
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                state.drums.chain_push(p);
+            } else {
+                state.drums.chain_mode = !state.drums.chain_mode;
+            }
         }
         _ => {}
     }
@@ -1074,13 +1088,25 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
                 );
             }
         }
-        KeyCode::Char('1') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+        // Shift+1 / Shift+2 (or ! / @): load starter grids into the *current* pattern slot.
+        _ if key_shifted_digit_row(&key, '1', '!') => {
             clear_confirm(ui);
             apply_pattern(state, 0);
+            set_notice(ui, "Starter A loaded into this pattern".to_string());
         }
-        KeyCode::Char('2') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+        _ if key_shifted_digit_row(&key, '2', '@') => {
             clear_confirm(ui);
             apply_pattern(state, 1);
+            set_notice(ui, "Starter B loaded into this pattern".to_string());
+        }
+        // Plain 1-8: select which pattern bank is being edited (append banks to the list with | or Shift+\).
+        KeyCode::Char(c @ '1'..='8') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            clear_confirm(ui);
+            let idx = (c as u8 - b'1') as usize;
+            if idx < NUM_PATTERNS {
+                state.drums.current_pattern = idx;
+                set_notice(ui, format!("Editing pattern {}", idx + 1));
+            }
         }
         KeyCode::Char(',') => {
             clear_confirm(ui);
@@ -1109,17 +1135,21 @@ fn handle_drum_key(ui: &mut UiLocalState, key: KeyEvent, state: &mut AppState) {
             state.drums.current_pattern = (state.drums.current_pattern + 1).min(NUM_PATTERNS - 1);
             set_notice(ui, format!("Editing pattern {}", state.drums.current_pattern + 1));
         }
-        // Chain controls: \ toggles chain mode
-        KeyCode::Char('\\') => {
-            clear_confirm(ui);
-            state.drums.chain_mode = !state.drums.chain_mode;
-            set_notice(ui, format!("Chain mode {}", if state.drums.chain_mode { "ON" } else { "OFF" }));
-        }
-        // | (shift+\) adds current pattern to chain
+        // Chain: plain \ toggles playing the bank list; | or Shift+\ appends current bank (many terminals emit Shift+\ as \\ + Shift).
         KeyCode::Char('|') => {
             clear_confirm(ui);
             state.drums.chain_push(state.drums.current_pattern);
-            set_notice(ui, format!("Added pattern {} to chain (len={})", state.drums.current_pattern + 1, state.drums.chain.len()));
+            set_notice(ui, format!("Added bank {} to list (len={})", state.drums.current_pattern + 1, state.drums.chain.len()));
+        }
+        KeyCode::Char('\\') => {
+            clear_confirm(ui);
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                state.drums.chain_push(state.drums.current_pattern);
+                set_notice(ui, format!("Added bank {} to list (len={})", state.drums.current_pattern + 1, state.drums.chain.len()));
+            } else {
+                state.drums.chain_mode = !state.drums.chain_mode;
+                set_notice(ui, format!("Play pattern list {}", if state.drums.chain_mode { "ON" } else { "OFF" }));
+            }
         }
         // Backspace removes last pattern from chain
         KeyCode::Backspace => {
@@ -1624,16 +1654,16 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
         );
     }
 
-    // SONG section - chain sequence
-    canvas.text_style(left_x + 2, song_top + 2, "CHN", UiStyle::Label);
+    // SONG section - chain sequence (plain \ = list-play on/off; | or Shift+\ = append bank)
+    canvas.text_style(left_x + 2, song_top + 2, "LIST", UiStyle::Label);
     canvas.text_style(
-        left_x + 6,
+        left_x + 8,
         song_top + 2,
         if state.drums.chain_mode { "ON " } else { "OFF" },
         if state.drums.chain_mode { UiStyle::Active } else { UiStyle::Hint },
     );
     // Display chain sequence (fits in remaining width)
-    let chain_display_width = left_w.saturating_sub(12);
+    let chain_display_width = left_w.saturating_sub(18);
     let chain_str: String = if state.drums.chain.is_empty() {
         "-- empty --".to_string()
     } else {
@@ -1650,7 +1680,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
             .join("→")
     };
     canvas.text_style(
-        left_x + 10,
+        left_x + 13,
         song_top + 2,
         &short_label(&chain_str, chain_display_width),
         UiStyle::Value,
@@ -1660,7 +1690,7 @@ fn render(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<RenderedFrame>
     canvas.text_style(
         left_x + 2,
         song_top + 3,
-        &short_label("{/} pat  |add  BS rem  \\ mode", left_w.saturating_sub(4)),
+        &short_label("1-8 bank  Sh+1/2 fill  {/}  | add  BS pop  Del clr  \\ list", left_w.saturating_sub(4)),
         UiStyle::Hint,
     );
 
@@ -2361,16 +2391,6 @@ fn prev_page(page: SettingsPage) -> SettingsPage {
     }
 }
 
-fn next_project_name(existing: &[ProjectTarget]) -> String {
-    for idx in 1..10_000 {
-        let name = format!("project-{idx:04}.mush");
-        if existing.iter().all(|item| item.name != name) {
-            return name;
-        }
-    }
-    "project-9999.mush".to_string()
-}
-
 fn settings_row_count(page: SettingsPage, visual_mode: VisualMode) -> usize {
     match page {
         SettingsPage::Main => 22,
@@ -2378,7 +2398,7 @@ fn settings_row_count(page: SettingsPage, visual_mode: VisualMode) -> usize {
             VisualMode::Scope => 2,   // Visual + Drums scope
             _ => 3,                   // Visual + FX Style + FX Depth (all framebuffer visuals)
         },
-        SettingsPage::Project => 3,
+        SettingsPage::Project => 4,
         SettingsPage::SoundDevice => 4,
         SettingsPage::Midi => 14,
     }
@@ -2528,8 +2548,12 @@ fn build_help_paint_rows(inner_w: usize) -> Vec<HelpPaintRow> {
                     "←→ step, ↑↓ voice, [ ] row volume.",
                 ),
                 (
-                    "[SPC] [r] [c] [X] [1] [2]",
-                    "Toggle step/run, clear, load pattern.",
+                    "[\\] [|]",
+                    "Drums: \\ toggles play-through-pattern-list; | or Shift+\\ appends current bank to that list.",
+                ),
+                (
+                    "[SPC] [r] [c] [X] [1-8] [Sh+1/2]",
+                    "Drums: 1-8 select pattern bank; Shift+1/2 load starter into current bank; step/run/clear.",
                 ),
                 ("[Settings]", "S / Esc — [ ] pages, arrows adjust row."),
             ],
@@ -2835,7 +2859,8 @@ fn settings_lines(state: &AppState, ui: &UiLocalState) -> Vec<String> {
             vec![
                 selected(0, format!("Project   {}", current)),
                 selected(1, "Open  [ENTER]".to_string()),
-                selected(2, "Save next  [ENTER]".to_string()),
+                selected(2, "Save current  [ENTER]".to_string()),
+                selected(3, "Save as new  [ENTER]".to_string()),
                 status,
             ]
         }
@@ -3131,10 +3156,21 @@ fn activate_setting(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<()> 
                             name: "demo.mush".to_string(),
                         })
                 };
-                match runtime.load_project(&target.name) {
+                let loaded_name = target.name.clone();
+                match runtime.load_project(&loaded_name) {
                     Ok(()) => {
-                        let mut loaded = runtime.state.lock();
-                        loaded.project.status = format!("loaded {}", target.name);
+                        let mut st = runtime.state.lock();
+                        st.project.status = format!("loaded {loaded_name}");
+                        if let Some(pos) = st
+                            .project
+                            .available
+                            .iter()
+                            .position(|p| p.name == loaded_name)
+                        {
+                            ui.project_index = pos;
+                        } else {
+                            ui.project_index = 0;
+                        }
                     }
                     Err(e) => {
                         let mut state = runtime.state.lock();
@@ -3143,16 +3179,64 @@ fn activate_setting(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<()> 
                 }
             }
             2 => {
-                let name = {
+                let name_opt = {
                     let state = runtime.state.lock();
-                    next_project_name(&state.project.available)
+                    state
+                        .project
+                        .available
+                        .get(ui.project_index)
+                        .map(|p| p.name.clone())
+                };
+                let Some(name) = name_opt else {
+                    let mut state = runtime.state.lock();
+                    state.project.status =
+                        "No project file selected (←→ pick one, or Save as new).".to_string();
+                    return Ok(());
                 };
                 match runtime.save_project(&name) {
                     Ok(_) => {
                         let mut state = runtime.state.lock();
                         state.project.available =
                             mush_core::project_io::list_projects(runtime.base_dir()).unwrap_or_default();
-                        state.project.status = format!("saved {name}");
+                        if let Some(pos) = state.project.available.iter().position(|p| p.name == name) {
+                            ui.project_index = pos;
+                        } else {
+                            ui.project_index = ui.project_index.min(
+                                state.project.available.len().saturating_sub(1),
+                            );
+                        }
+                        state.project.status = format!("wrote {name}");
+                    }
+                    Err(e) => {
+                        let mut state = runtime.state.lock();
+                        state.project.status = format!("save error: {e}");
+                    }
+                }
+            }
+            3 => {
+                let name = match mush_core::project_io::next_free_numbered_project_name(
+                    runtime.base_dir(),
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let mut state = runtime.state.lock();
+                        state.project.status = format!("project list: {e}");
+                        return Ok(());
+                    }
+                };
+                match runtime.save_project(&name) {
+                    Ok(_) => {
+                        let mut state = runtime.state.lock();
+                        state.project.available =
+                            mush_core::project_io::list_projects(runtime.base_dir()).unwrap_or_default();
+                        if let Some(pos) = state.project.available.iter().position(|p| p.name == name) {
+                            ui.project_index = pos;
+                        } else {
+                            ui.project_index = ui.project_index.min(
+                                state.project.available.len().saturating_sub(1),
+                            );
+                        }
+                        state.project.status = format!("saved new {name}");
                     }
                     Err(e) => {
                         let mut state = runtime.state.lock();

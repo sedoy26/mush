@@ -43,6 +43,19 @@ pub fn list_projects(base_dir: &Path) -> Result<Vec<ProjectTarget>> {
     Ok(items)
 }
 
+/// Next `project-NNNN.mush` that is not already on disk (always reads `projects/`).
+/// Use this for "save new" flows so we never pick a slot that exists but was missing from in-memory `available`.
+pub fn next_free_numbered_project_name(base_dir: &Path) -> Result<String> {
+    let existing = list_projects(base_dir)?;
+    for idx in 1..10_000 {
+        let name = format!("project-{idx:04}.mush");
+        if existing.iter().all(|item| item.name != name) {
+            return Ok(name);
+        }
+    }
+    anyhow::bail!("no free project-NNNN slot")
+}
+
 pub fn save_project(base_dir: &Path, name: &str, state: &AppState) -> Result<PathBuf> {
     ensure_runtime_dirs(base_dir)?;
     let file_name = normalize_project_name(name);
@@ -185,4 +198,32 @@ pub fn load_loop_wav(path: &Path) -> Result<(Vec<f32>, usize)> {
     
     let len = samples.len();
     Ok((samples, len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn next_free_skips_existing_on_disk() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mush-proj-io-test-{uniq}"));
+        let _ = fs::remove_dir_all(&dir);
+        ensure_runtime_dirs(&dir).unwrap();
+        assert_eq!(
+            next_free_numbered_project_name(&dir).unwrap(),
+            "project-0001.mush"
+        );
+        fs::write(projects_dir(&dir).join("project-0001.mush"), "{}").unwrap();
+        assert_eq!(
+            next_free_numbered_project_name(&dir).unwrap(),
+            "project-0002.mush"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

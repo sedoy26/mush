@@ -92,6 +92,10 @@ impl Runtime {
             _midi_conn: None,
             camera: None,
         };
+        {
+            let mut s = runtime.state.lock();
+            s.project.available = project_io::list_projects(runtime.base_dir()).unwrap_or_default();
+        }
         runtime.refresh_audio_devices();
         runtime.refresh_midi_devices();
         Ok(runtime)
