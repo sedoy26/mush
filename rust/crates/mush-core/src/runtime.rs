@@ -51,6 +51,21 @@ fn sanitize_app_state_after_load(state: &mut AppState) {
     state.drums.triggers = [false; 6];
 }
 
+/// Every session start (blank app or loaded project): show help first and keep transport idle
+/// until the user dismisses help and explicitly runs or plays loops.
+fn apply_startup_session_policy(state: &mut AppState) {
+    state.ui.settings_open = false;
+    state.ui.help_open = true;
+    state.drums.running = false;
+    state.looper.playing = false;
+    state.looper.recording = false;
+    state.looper.overdub = false;
+    state.sample.performance_loop.playing = false;
+    state.sample.performance_loop.recording = false;
+    state.sample.performance_loop.overdub = false;
+    state.audio.global_recording.recording = false;
+}
+
 pub struct Runtime {
     /// Application state (owned by UI thread)
     pub state: Arc<Mutex<AppState>>,
@@ -94,6 +109,7 @@ impl Runtime {
         };
         {
             let mut s = runtime.state.lock();
+            apply_startup_session_policy(&mut s);
             s.project.available = project_io::list_projects(runtime.base_dir()).unwrap_or_default();
         }
         runtime.refresh_audio_devices();
@@ -637,6 +653,7 @@ impl Runtime {
 
         sanitize_app_state_after_load(&mut loaded);
         loaded.project.available = project_io::list_projects(&self.base_dir).unwrap_or_default();
+        apply_startup_session_policy(&mut loaded);
 
         *self.state.lock() = loaded;
 

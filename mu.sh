@@ -1859,7 +1859,7 @@ def draw_help_overlay(scr, h, w, scope_attr, C, B, DIM):
     left_x = box_x + 3
 
     draw_box(scr, box_y, box_x, box_w, box_h, "MUSH HELP", scope_attr|B)
-    safe_addstr(scr, box_y + 1, left_x, "Terminal based music production center", C[3]|B)
+    safe_addstr(scr, box_y + 1, left_x, "Terminal synth + drums + looper", C[3]|B)
     if box_w >= 72:
         safe_addstr(scr, box_y + 1, box_x + box_w - 28, "Hold H to keep this visible", C[6])
     else:

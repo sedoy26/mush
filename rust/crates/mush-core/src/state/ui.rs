@@ -274,7 +274,7 @@ fn default_cube_hat_rewind() -> f32 {
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            help_open: false,
+            help_open: true,
             settings_open: false,
             settings_page: SettingsPage::Main,
             theme: Theme::Magenta,
