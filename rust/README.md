@@ -17,7 +17,11 @@ The audio engine uses a **lock-free** architecture to prevent priority inversion
 
 Sample rate is dynamically set from the CPAL device (48kHz on most modern systems) rather than hardcoded.
 
-## Startup
+## Install without Cargo
+
+See **[GitHub Releases](https://github.com/sedoy26/mush/releases)** for pre-built `mush-cli` (v0.0.1+). Download the artifact for your OS, `chmod +x` on Unix, run from the **repo root** next to `projects/` and `wav/`. Optional: `ffmpeg` for camera mode.
+
+## Startup (from source)
 
 From the repository root:
 

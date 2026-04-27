@@ -1,0 +1,82 @@
+# Build precompiled mush-cli binaries and attach them to a GitHub Release when you push a version tag (e.g. v0.0.1).
+# The tag may point at any branch (e.g. refactoring/rust before merge); checkout uses the tagged commit.
+# Requires: default GITHUB_TOKEN with contents: write (enabled for Actions in repo Settings).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: mush-cli
+            artifact_name: mush-cli-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: mush-cli.exe
+            artifact_name: mush-cli-windows-x86_64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: mush-cli
+            artifact_name: mush-cli-macos-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: mush-cli
+            artifact_name: mush-cli-macos-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cargo build
+        working-directory: rust
+        run: cargo build -p mush-cli --release --target ${{ matrix.target }}
+
+      - name: Strip (Unix)
+        if: runner.os != 'Windows'
+        working-directory: rust
+        run: strip target/${{ matrix.target }}/release/${{ matrix.bin }} || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: rust/target/${{ matrix.target }}/release/${{ matrix.bin }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List artifacts
+        run: find dist -type f -ls
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          body: |
+            Pre-built **mush-cli** — no Rust toolchain needed. Pick the asset for your OS from the table in the repo README (**Install (binary, no Rust)**). Run the binary from the **repository root** next to `projects/` and `wav/`. Working audio output is required; **ffmpeg** on `PATH` is optional (camera mode only).
+          files: dist/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

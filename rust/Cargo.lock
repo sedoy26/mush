@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "mush-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "mush-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "arc-swap",
