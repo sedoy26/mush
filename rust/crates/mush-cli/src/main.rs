@@ -2236,6 +2236,7 @@ fn theme_scope_seq(theme: Theme) -> &'static str {
         Theme::Magenta => "\x1b[35;49m",
         Theme::Mint => "\x1b[36;49m",
         Theme::Amber => "\x1b[33;49m",
+        Theme::Ocean => "\x1b[34;49m",
     }
 }
 
@@ -2244,6 +2245,7 @@ fn theme_rgb(theme: Theme) -> (u8, u8, u8) {
         Theme::Magenta => (200, 100, 220),
         Theme::Mint => (100, 220, 200),
         Theme::Amber => (220, 180, 100),
+        Theme::Ocean => (90, 150, 240),
     }
 }
 
@@ -2252,6 +2254,7 @@ fn theme_header_seq(theme: Theme) -> &'static str {
         Theme::Magenta => "\x1b[30;45;1m",
         Theme::Mint => "\x1b[30;46;1m",
         Theme::Amber => "\x1b[30;43;1m",
+        Theme::Ocean => "\x1b[30;44;1m",
     }
 }
 
@@ -2453,6 +2456,7 @@ fn theme_name(theme: Theme) -> &'static str {
         Theme::Magenta => "MAGENTA",
         Theme::Mint => "MINT",
         Theme::Amber => "AMBER",
+        Theme::Ocean => "OCEAN",
     }
 }
 
@@ -2851,6 +2855,16 @@ fn draw_help_overlay(
         UiStyle::Backdrop,
         max_x,
     );
+    let ver = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+    if width > ver.chars().count() + 4 {
+        canvas.text_clipped(
+            x + width.saturating_sub(ver.chars().count() + 2),
+            y + height.saturating_sub(1),
+            &ver,
+            UiStyle::Scope,
+            max_x,
+        );
+    }
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -3567,7 +3581,7 @@ fn cycle_visual_fx(style: VisualFx, delta: i32) -> VisualFx {
 }
 
 fn cycle_theme(theme: Theme, delta: i32) -> Theme {
-    let all = [Theme::Magenta, Theme::Mint, Theme::Amber];
+    let all = [Theme::Magenta, Theme::Mint, Theme::Amber, Theme::Ocean];
     let idx = all.iter().position(|item| *item == theme).unwrap_or(0);
     all[(idx as i32 + delta).rem_euclid(all.len() as i32) as usize]
 }

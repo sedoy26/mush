@@ -7,6 +7,7 @@ pub enum Theme {
     Magenta,
     Mint,
     Amber,
+    Ocean,
 }
 
 #[derive(Deserialize)]
@@ -23,11 +24,13 @@ impl TryFrom<ThemeHelper> for Theme {
             ThemeHelper::Int(0) => Ok(Theme::Magenta),
             ThemeHelper::Int(1) => Ok(Theme::Mint),
             ThemeHelper::Int(2) => Ok(Theme::Amber),
+            ThemeHelper::Int(3) => Ok(Theme::Ocean),
             ThemeHelper::Int(i) => Err(format!("invalid theme index: {}", i)),
             ThemeHelper::Str(s) => match s.as_str() {
                 "Magenta" => Ok(Theme::Magenta),
                 "Mint" => Ok(Theme::Mint),
                 "Amber" => Ok(Theme::Amber),
+                "Ocean" => Ok(Theme::Ocean),
                 _ => Err(format!("invalid theme: {}", s)),
             },
         }
