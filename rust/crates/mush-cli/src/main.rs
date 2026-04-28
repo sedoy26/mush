@@ -1,6 +1,7 @@
 use std::{
     io::{self, Stdout, Write},
     path::PathBuf,
+    sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -27,11 +28,15 @@ use mush_core::state::{
 use mush_core::visuals::{Framebuffer, ParamValue, VisualRegistry};
 use mush_core::Runtime;
 
+mod updater;
+
 const INPUT_POLL_MS: u64 = 16;
 
 fn main() -> Result<()> {
     let base_dir = detect_base_dir()?;
-    let mut runtime = Runtime::new(base_dir)?;
+    let prefs = updater::load_user_prefs(&base_dir);
+    let mut runtime = Runtime::new(base_dir.clone())?;
+    runtime.state.lock().ui.auto_update = prefs.auto_update;
     if let Err(e) = runtime.start_audio() {
         eprintln!("mush: audio init failed: {e}");
         eprintln!("mush: starting UI without audio; check output device/settings.");
@@ -63,6 +68,12 @@ fn main() -> Result<()> {
     }
 
     let mut ui = UiLocalState::default();
+    if prefs.auto_update {
+        ui.update_rx = Some(updater::spawn_auto_update_check(
+            base_dir,
+            env!("CARGO_PKG_VERSION").to_string(),
+        ));
+    }
     let result = run_app(&mut stdout, &mut runtime, &mut ui);
 
     #[cfg(unix)]
@@ -106,6 +117,7 @@ fn run_app(stdout: &mut Stdout, runtime: &mut Runtime, ui: &mut UiLocalState) ->
     draw_overlay_mask_region(stdout, &last_frame, ui)?;
     stdout.flush()?;
     loop {
+        poll_update_notice(runtime, ui);
         runtime.poll_background()?;
         runtime.sync_audio();  // Sync UI state to audio and read reactive levels
         update_keyboard_note_timeout(runtime, ui);
@@ -141,6 +153,22 @@ fn run_app(stdout: &mut Stdout, runtime: &mut Runtime, ui: &mut UiLocalState) ->
         }
     }
     Ok(())
+}
+
+fn poll_update_notice(runtime: &mut Runtime, ui: &mut UiLocalState) {
+    let Some(rx) = ui.update_rx.as_ref() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(msg) => {
+            runtime.state.lock().audio.status = msg;
+            ui.update_rx = None;
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            ui.update_rx = None;
+        }
+    }
 }
 
 fn draw_frame_full(stdout: &mut Stdout, frame: &RenderedFrame) -> Result<()> {
@@ -2256,6 +2284,7 @@ struct UiLocalState {
     overlay_mask: Option<(usize, usize, usize, usize)>,
     /// First visible body line index in the help overlay (see `draw_help_overlay`).
     help_scroll: usize,
+    update_rx: Option<Receiver<String>>,
 }
 
 impl Default for UiLocalState {
@@ -2279,6 +2308,7 @@ impl Default for UiLocalState {
             visual_pos: (0, 0),
             overlay_mask: None,
             help_scroll: 0,
+            update_rx: None,
         }
     }
 }
@@ -2486,7 +2516,7 @@ fn prev_page(page: SettingsPage) -> SettingsPage {
 
 fn settings_row_count(page: SettingsPage, visual_mode: VisualMode) -> usize {
     match page {
-        SettingsPage::Main => 22,
+        SettingsPage::Main => 23,
         SettingsPage::Visuals => match visual_mode {
             VisualMode::Scope => 2,
             VisualMode::Donut => 2,
@@ -2926,6 +2956,13 @@ fn settings_lines(state: &AppState, ui: &UiLocalState) -> Vec<String> {
                     if state.sample.play_enabled { "ON " } else { "OFF" }
                 ),
             ),
+            selected(
+                22,
+                format!(
+                    "Auto updt  {}",
+                    if state.ui.auto_update { "ON " } else { "OFF" }
+                ),
+            ),
         ],
         SettingsPage::Visuals => {
             let mut rows = vec![selected(0, format!("Visual     {}", state.ui.visual_mode.name()))];
@@ -3081,6 +3118,7 @@ fn settings_lines(state: &AppState, ui: &UiLocalState) -> Vec<String> {
 }
 
 fn adjust_setting(runtime: &mut Runtime, ui: &mut UiLocalState, delta: i32) -> Result<()> {
+    let mut persist_auto_update: Option<bool> = None;
     let mut state = runtime.state.lock();
     match state.ui.settings_page {
         SettingsPage::Main => match ui.settings_cursor {
@@ -3157,6 +3195,12 @@ fn adjust_setting(runtime: &mut Runtime, ui: &mut UiLocalState, delta: i32) -> R
                     state.sample.play_enabled = false;
                 } else if delta > 0 {
                     state.sample.play_enabled = true;
+                }
+            }
+            22 => {
+                if delta != 0 {
+                    state.ui.auto_update = delta > 0;
+                    persist_auto_update = Some(state.ui.auto_update);
                 }
             }
             _ => {}
@@ -3258,6 +3302,20 @@ fn adjust_setting(runtime: &mut Runtime, ui: &mut UiLocalState, delta: i32) -> R
             _ => {}
         },
     }
+    drop(state);
+    if let Some(enabled) = persist_auto_update {
+        if let Err(e) = updater::save_user_prefs(runtime.base_dir(), &updater::UserPrefs { auto_update: enabled }) {
+            runtime.state.lock().audio.status = format!("Auto-update pref save failed: {e}");
+        } else if enabled && ui.update_rx.is_none() {
+            ui.update_rx = Some(updater::spawn_auto_update_check(
+                runtime.base_dir().clone(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ));
+        } else if !enabled {
+            ui.update_rx = None;
+            runtime.state.lock().audio.status = "Auto-update disabled".to_string();
+        }
+    }
     Ok(())
 }
 
@@ -3275,6 +3333,27 @@ fn activate_setting(runtime: &mut Runtime, ui: &mut UiLocalState) -> Result<()> 
             }
             12 => {
                 runtime.state.lock().sample.clear_buffer();
+            }
+            22 => {
+                let enabled = {
+                    let mut state = runtime.state.lock();
+                    state.ui.auto_update = !state.ui.auto_update;
+                    state.ui.auto_update
+                };
+                if let Err(e) =
+                    updater::save_user_prefs(runtime.base_dir(), &updater::UserPrefs { auto_update: enabled })
+                {
+                    runtime.state.lock().audio.status = format!("Auto-update pref save failed: {e}");
+                } else if enabled {
+                    ui.update_rx = Some(updater::spawn_auto_update_check(
+                        runtime.base_dir().clone(),
+                        env!("CARGO_PKG_VERSION").to_string(),
+                    ));
+                    runtime.state.lock().audio.status = "Auto-update enabled".to_string();
+                } else {
+                    ui.update_rx = None;
+                    runtime.state.lock().audio.status = "Auto-update disabled".to_string();
+                }
             }
             _ => {}
         },

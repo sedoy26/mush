@@ -519,6 +519,8 @@ dependencies = [
  "crossterm",
  "mush-core",
  "parking_lot",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

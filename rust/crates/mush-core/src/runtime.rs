@@ -561,6 +561,7 @@ impl Runtime {
     }
 
     pub fn load_project(&mut self, name: &str) -> Result<()> {
+        let current_auto_update = self.state.lock().ui.auto_update;
         let mut loaded = project_io::load_project(&self.base_dir, name)?;
         
         // Try to load loop WAV if it exists
@@ -656,6 +657,7 @@ impl Runtime {
         loaded.sample.performance_loop.undo_stack.clear();
 
         sanitize_app_state_after_load(&mut loaded);
+        loaded.ui.auto_update = current_auto_update;
         loaded.project.available = project_io::list_projects(&self.base_dir).unwrap_or_default();
         apply_startup_session_policy(&mut loaded);
 

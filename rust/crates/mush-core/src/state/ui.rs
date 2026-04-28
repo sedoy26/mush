@@ -255,6 +255,8 @@ pub struct UiState {
     #[serde(default = "default_cube_hat_rewind")]
     pub cube_hat_rewind: f32,
     pub scope_show_drums: bool,
+    #[serde(default = "default_auto_update")]
+    pub auto_update: bool,
     #[serde(default)]
     pub tab_focus: TabFocus,
 }
@@ -271,6 +273,10 @@ fn default_cube_hat_rewind() -> f32 {
     0.4
 }
 
+fn default_auto_update() -> bool {
+    true
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
@@ -285,6 +291,7 @@ impl Default for UiState {
             cube_kick_punch: default_cube_kick_punch(),
             cube_hat_rewind: default_cube_hat_rewind(),
             scope_show_drums: true,
+            auto_update: default_auto_update(),
             tab_focus: TabFocus::default(),
         }
     }
