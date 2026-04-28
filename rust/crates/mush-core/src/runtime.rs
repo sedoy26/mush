@@ -471,12 +471,16 @@ impl Runtime {
         let state = Arc::clone(&self.state);
         let midi_q = Arc::clone(&self.midi_sample_cmds);
         let bridge = Arc::clone(&self.bridge);
-        let conn = midi.connect(
-            &port,
-            "mush-midi-input",
-            move |_stamp, message, _| on_midi_message(&state, &bridge, &midi_q, message),
-            (),
-        )?;
+        let conn = midi
+            .connect(
+                &port,
+                "mush-midi-input",
+                move |_stamp, message, _| on_midi_message(&state, &bridge, &midi_q, message),
+                (),
+            )
+            // midir's ConnectError includes MidiInput internals that are not Sync on Linux ALSA,
+            // so convert to a stringly anyhow error instead of using `?` directly.
+            .map_err(|e| anyhow::anyhow!("failed to open MIDI input '{port_name}': {e}"))?;
 
         self._midi_conn = Some(conn);
         let mut state = self.state.lock();
