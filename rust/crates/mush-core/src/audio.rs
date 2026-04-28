@@ -566,9 +566,14 @@ struct AudioEngine {
     env: f32,  // Keep for UI feedback
     freq_current: f32,
     lfo_phase: f32,
+    // 4-pole ladder filter integrator states (24 dB/oct low-pass).
     filter_z1: f32,
-    _filter_z2: f32,  // Reserved for resonant filter (unused currently)
+    filter_z2: f32,
+    filter_z3: f32,
+    filter_z4: f32,
+    filter_in1: f32,
     current_cutoff: f32,      // Smoothed filter cutoff (prevents zipper noise)
+    current_resonance: f32,   // Smoothed resonance/Q amount
     current_gain: f32,        // Smoothed gain (prevents zipper noise)
     fx_synth: FxBusScratch,
     fx_sample: FxBusScratch,
@@ -623,8 +628,12 @@ impl AudioEngine {
             freq_current: midi_to_freq(60),
             lfo_phase: 0.0,
             filter_z1: 0.0,
-            _filter_z2: 0.0,
+            filter_z2: 0.0,
+            filter_z3: 0.0,
+            filter_z4: 0.0,
+            filter_in1: 0.0,
             current_cutoff: 0.5,      // Start at mid-range cutoff
+            current_resonance: 0.0,
             current_gain: 0.7,        // Start at typical volume
             fx_synth: FxBusScratch::new(sample_rate),
             fx_sample: FxBusScratch::new(sample_rate),
@@ -1025,21 +1034,50 @@ impl AudioEngine {
                 } else {
                     synth.cutoff.clamp(0.02, 0.98)
                 };
+                let target_resonance = synth.resonance.clamp(0.0, 1.0);
                 // Smooth cutoff changes to prevent zipper noise (~5ms smoothing)
                 let cutoff_alpha = dsp::attack_coeff(0.005, self.sample_rate);
                 self.current_cutoff += (target_cutoff - self.current_cutoff) * cutoff_alpha;
-                
-                // Convert normalized 0-1 cutoff to actual frequency (exponential mapping)
-                // This gives musically useful range: 20Hz at 0.0, 18kHz at 1.0
+                self.current_resonance +=
+                    (target_resonance - self.current_resonance) * cutoff_alpha;
+
+                // Convert normalized 0-1 cutoff to actual frequency (exponential mapping).
                 let cutoff_freq = FILTER_MIN_FREQ * (FILTER_MAX_FREQ / FILTER_MIN_FREQ).powf(self.current_cutoff);
-                
-                // Calculate proper one-pole lowpass coefficient from frequency
-                // alpha = 1 - exp(-2π * fc / sr) for accurate coefficient
-                let omega = 2.0 * std::f32::consts::PI * cutoff_freq / self.sample_rate;
-                let alpha = (1.0 - (-omega).exp()).clamp(0.0001, 0.9999);
-                
-                self.filter_z1 += (value - self.filter_z1) * alpha;
-                value = self.filter_z1;
+
+                // Proper 24 dB/oct resonant ladder (Moog-style approximation).
+                // Ref: classic 4-pole recursive ladder formulation with feedback `q`.
+                let f = (cutoff_freq / (self.sample_rate * 0.5)).clamp(0.0, 0.99);
+                let p = f * (1.8 - 0.8 * f);
+                let k = 2.0 * p - 1.0;
+                let t = (1.0 - p) * 1.386_249;
+                let t2 = 12.0 + t * t;
+                let q = (self.current_resonance * (t2 + 6.0 * t) / (t2 - 6.0 * t)).clamp(0.0, 4.0);
+
+                // Feedback around the 4th pole.
+                let mut x = value - q * self.filter_z4;
+                x = x.tanh();
+
+                let prev1 = self.filter_z1;
+                self.filter_z1 = (x + self.filter_in1) * p - self.filter_z1 * k;
+                let prev2 = self.filter_z2;
+                self.filter_z2 = (self.filter_z1 + prev1) * p - self.filter_z2 * k;
+                let prev3 = self.filter_z3;
+                self.filter_z3 = (self.filter_z2 + prev2) * p - self.filter_z3 * k;
+                self.filter_z4 = (self.filter_z3 + prev3) * p - self.filter_z4 * k;
+
+                // Soft clip stage 4 to match analog-ish saturation and tame instability.
+                self.filter_z4 -= (self.filter_z4 * self.filter_z4 * self.filter_z4) * 0.166_667;
+                self.filter_in1 = x;
+
+                value = self.filter_z4;
+                if !value.is_finite() {
+                    self.filter_z1 = 0.0;
+                    self.filter_z2 = 0.0;
+                    self.filter_z3 = 0.0;
+                    self.filter_z4 = 0.0;
+                    self.filter_in1 = 0.0;
+                    value = 0.0;
+                }
             }
 
             self.last_output = value;

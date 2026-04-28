@@ -3678,7 +3678,8 @@ fn render_scope_braille(samples: &[f32], width: usize, height: usize) -> Vec<Str
     let mut rows = Vec::with_capacity(dw);
     for dx in 0..dw {
         let idx = dx * samples.len() / dw;
-        let sig = samples[idx.min(samples.len() - 1)].clamp(-1.0, 1.0);
+        let raw = samples[idx.min(samples.len() - 1)];
+        let sig = if raw.is_finite() { raw.clamp(-1.0, 1.0) } else { 0.0 };
         let row = (((1.0 - sig) * 0.5) * (dh.saturating_sub(1) as f32)).round() as usize;
         rows.push(row.min(dh.saturating_sub(1)));
     }
