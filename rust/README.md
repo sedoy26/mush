@@ -19,7 +19,7 @@ Sample rate is dynamically set from the CPAL device (48kHz on most modern system
 
 ## Install without Cargo
 
-See **[GitHub Releases](https://github.com/sedoy26/mush/releases)** for pre-built `mush-cli` (v0.0.1+). Download the artifact for your OS, `chmod +x` on Unix, run from anywhere. The app auto-creates and uses `projects/` and `wav/` next to the executable. Optional: `ffmpeg` for camera mode.
+See **[GitHub Releases](https://github.com/sedoy26/mush/releases)** for pre-built `mush-cli` (v0.0.1+). Download and extract the archive for your OS (`.tar.gz` on macOS/Linux, `.zip` on Windows), then run the included binary. The app auto-creates and uses `projects/` and `wav/` next to the executable. Optional: `ffmpeg` for camera mode.
 
 ## Startup (from source)
 

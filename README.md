@@ -29,10 +29,11 @@ cargo run --manifest-path rust/Cargo.toml -p mush-cli
 
 For tagged versions (e.g. **v0.0.1**), pre-built **`mush-cli`** binaries are attached on **[GitHub Releases](https://github.com/sedoy26/mush/releases)** (Linux x86_64, Windows x86_64, macOS Apple Silicon and Intel). A tag can be pushed from a feature branch before it merges; see `rust/RELEASING.md`.
 
-1. Download the asset that matches your OS.
-2. **macOS / Linux:** `chmod +x mush-cli-*` then run `./mush-cli-…` from a terminal.
-3. **Windows:** run `mush-cli-windows-x86_64.exe` from PowerShell or cmd.
-4. Run `mush-cli` from anywhere; it auto-uses the binary's folder for `projects/` and `wav/` (created on first run). To share data with the shell script version, run it from the repository root.
+1. Download the archive asset that matches your OS.
+2. Extract the archive.
+3. **macOS / Linux:** run `./mush-cli-*` from a terminal (no manual `chmod` needed; archive preserves executable bit).
+4. **Windows:** run `mush-cli-windows-x86_64.exe` from PowerShell or cmd.
+5. Run `mush-cli` from anywhere; it auto-uses the binary's folder for `projects/` and `wav/` (created on first run). To share data with the shell script version, run it from the repository root.
 
 You still need a working audio device. **Camera** visual mode additionally expects **`ffmpeg`** on your `PATH` (optional for everything else).
 

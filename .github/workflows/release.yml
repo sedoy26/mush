@@ -28,7 +28,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: mush-cli.exe
-            artifact_name: mush-cli-windows-x86_64.exe
+            artifact_name: mush-cli-windows-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
             bin: mush-cli
@@ -62,11 +62,36 @@ jobs:
         working-directory: rust
         run: strip target/${{ matrix.target }}/release/${{ matrix.bin }} || true
 
-      - name: Upload artifact
+      - name: Package asset (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp "rust/target/${{ matrix.target }}/release/${{ matrix.bin }}" "package/${{ matrix.artifact_name }}"
+          chmod +x "package/${{ matrix.artifact_name }}"
+          tar -czf "${{ matrix.artifact_name }}.tar.gz" -C package "${{ matrix.artifact_name }}"
+
+      - name: Package asset (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item "rust/target/${{ matrix.target }}/release/${{ matrix.bin }}" "package/${{ matrix.artifact_name }}.exe"
+          Compress-Archive -Path "package/${{ matrix.artifact_name }}.exe" -DestinationPath "${{ matrix.artifact_name }}.zip" -Force
+
+      - name: Upload artifact (Unix)
+        if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: rust/target/${{ matrix.target }}/release/${{ matrix.bin }}
+          path: ${{ matrix.artifact_name }}.tar.gz
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.zip
 
   release:
     needs: build
@@ -80,18 +105,17 @@ jobs:
       - name: List downloaded artifacts
         run: find dist -type f -ls
 
-      # Flatten upload-artifact layout (dist/<artifact-name>/<binary>) so gh-release gets simple globs.
-      - name: Stage release binaries
+      # Flatten upload-artifact layout (dist/<artifact-name>/<archive>) so gh-release gets simple globs.
+      - name: Stage release archives
         run: |
           set -euo pipefail
           mkdir -p assets
           shopt -s nullglob
           for dir in dist/*/; do
             [[ -d "$dir" ]] || continue
-            name="$(basename "$dir")"
             for f in "$dir"*; do
               [[ -f "$f" ]] || continue
-              cp -v "$f" "assets/$name"
+              cp -v "$f" "assets/"
             done
           done
           nfiles="$(find assets -type f | wc -l | tr -d '[:space:]')"
@@ -104,7 +128,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           body: |
-            Pre-built **mush-cli** — no Rust toolchain needed. Pick the asset for your OS from the table in the repo README (**Install (binary, no Rust)**). Run the binary from the **repository root** next to `projects/` and `wav/`. Working audio output is required; **ffmpeg** on `PATH` is optional (camera mode only).
+            Pre-built **mush-cli** — no Rust toolchain needed. Download the archive for your OS, extract it, then run the included binary. On macOS/Linux, executable permissions are preserved by the `.tar.gz` archive. Working audio output is required; **ffmpeg** on `PATH` is optional (camera mode only).
           files: assets/*
           fail_on_unmatched_files: true
         env:
