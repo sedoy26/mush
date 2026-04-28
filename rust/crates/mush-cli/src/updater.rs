@@ -92,10 +92,27 @@ fn check_and_download_update(base_dir: &Path, current_version: &str) -> Result<O
     let out_path = updates_dir.join(&asset.name);
     if let Ok(meta) = fs::metadata(&out_path) {
         if meta.len() == asset.size {
-            return Ok(Some(format!(
-                "Update v{latest_text} already downloaded: {}",
-                out_path.display()
-            )));
+            if cfg!(windows) {
+                let _ = prune_updates_dir(&updates_dir, &out_path);
+                return Ok(Some(format!(
+                    "Update v{latest_text} already downloaded: {} (Windows requires manual replace)",
+                    out_path.display()
+                )));
+            }
+            match install_downloaded_update(&out_path, &updates_dir) {
+                Ok(()) => {
+                    let _ = prune_updates_dir(&updates_dir, Path::new(""));
+                    return Ok(Some(format!(
+                        "Update v{latest_text} installed from cache. Restart mush-cli to use it."
+                    )));
+                }
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "Update v{latest_text} cached at {} (auto-install failed: {e})",
+                        out_path.display()
+                    )));
+                }
+            }
         }
     }
 

@@ -2855,13 +2855,13 @@ fn draw_help_overlay(
         UiStyle::Backdrop,
         max_x,
     );
-    let ver = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+    let ver = format!("[v{}]", env!("CARGO_PKG_VERSION"));
     if width > ver.chars().count() + 4 {
         canvas.text_clipped(
             x + width.saturating_sub(ver.chars().count() + 2),
             y + height.saturating_sub(1),
             &ver,
-            UiStyle::Scope,
+            UiStyle::Header,
             max_x,
         );
     }
