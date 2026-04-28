@@ -32,7 +32,10 @@ const INPUT_POLL_MS: u64 = 16;
 fn main() -> Result<()> {
     let base_dir = detect_base_dir()?;
     let mut runtime = Runtime::new(base_dir)?;
-    runtime.start_audio()?;
+    if let Err(e) = runtime.start_audio() {
+        eprintln!("mush: audio init failed: {e}");
+        eprintln!("mush: starting UI without audio; check output device/settings.");
+    }
 
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
