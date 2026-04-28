@@ -1,5 +1,6 @@
 use std::{
     fs,
+    fs::Permissions,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver},
@@ -7,6 +8,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/sedoy26/mush/releases/latest";
 const PREFS_FILE: &str = ".mush-cli-user.json";
@@ -101,10 +104,26 @@ fn check_and_download_update(base_dir: &Path, current_version: &str) -> Result<O
     fs::rename(&tmp_path, &out_path)
         .with_context(|| format!("move {} to {}", tmp_path.display(), out_path.display()))?;
 
-    Ok(Some(format!(
-        "Update v{latest_text} downloaded: {}",
-        out_path.display()
-    )))
+    if cfg!(windows) {
+        let _ = prune_updates_dir(&updates_dir, &out_path);
+        return Ok(Some(format!(
+            "Update v{latest_text} downloaded: {} (Windows requires manual replace)",
+            out_path.display()
+        )));
+    }
+
+    match install_downloaded_update(&out_path, &updates_dir) {
+        Ok(()) => {
+            let _ = prune_updates_dir(&updates_dir, Path::new(""));
+            Ok(Some(format!(
+                "Update v{latest_text} installed. Restart mush-cli to use it."
+            )))
+        }
+        Err(e) => Ok(Some(format!(
+            "Update v{latest_text} downloaded: {} (auto-install failed: {e})",
+            out_path.display()
+        ))),
+    }
 }
 
 fn fetch_latest_release_json(current_version: &str) -> Result<ReleaseInfo> {
@@ -154,6 +173,71 @@ fn download_with_curl(url: &str, out_path: &Path, current_version: &str) -> Resu
     Ok(())
 }
 
+fn install_downloaded_update(archive_path: &Path, updates_dir: &Path) -> Result<()> {
+    let exe_path = std::env::current_exe().context("resolve current executable path")?;
+    let extract_dir = updates_dir.join(".extract");
+    if extract_dir.exists() {
+        let _ = fs::remove_dir_all(&extract_dir);
+    }
+    fs::create_dir_all(&extract_dir).context("create update extract dir")?;
+
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(&extract_dir)
+        .status()
+        .context("spawn tar for update install")?;
+    if !status.success() {
+        anyhow::bail!("tar extraction failed");
+    }
+
+    let staged = extract_dir.join(target_binary_name());
+    if !staged.exists() {
+        anyhow::bail!("expected extracted binary missing: {}", staged.display());
+    }
+    #[cfg(unix)]
+    fs::set_permissions(&staged, Permissions::from_mode(0o755))
+        .context("set executable bit on staged binary")?;
+
+    let backup = exe_path.with_extension("old");
+    if backup.exists() {
+        let _ = fs::remove_file(&backup);
+    }
+
+    fs::rename(&exe_path, &backup).context("rename current binary to backup")?;
+    if let Err(e) = fs::rename(&staged, &exe_path) {
+        let _ = fs::rename(&backup, &exe_path);
+        return Err(e).context("move staged binary into place");
+    }
+
+    let _ = fs::remove_file(&backup);
+    let _ = fs::remove_dir_all(&extract_dir);
+    Ok(())
+}
+
+fn prune_updates_dir(updates_dir: &Path, keep: &Path) -> Result<()> {
+    if !updates_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(updates_dir).context("read updates dir for pruning")? {
+        let entry = entry.context("read updates dir entry")?;
+        let p = entry.path();
+        if !keep.as_os_str().is_empty() && p == keep {
+            continue;
+        }
+        if p.file_name().and_then(|s| s.to_str()) == Some(".extract") {
+            continue;
+        }
+        if p.is_dir() {
+            let _ = fs::remove_dir_all(&p);
+        } else {
+            let _ = fs::remove_file(&p);
+        }
+    }
+    Ok(())
+}
+
 fn parse_tag_version(raw: &str) -> Option<(u64, u64, u64)> {
     let trimmed = raw.trim().trim_start_matches('v');
     let mut parts = trimmed.split('.');
@@ -184,6 +268,34 @@ fn target_asset_name() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         "mush-cli-windows-x86_64.zip"
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
+    {
+        "unsupported-platform"
+    }
+}
+
+fn target_binary_name() -> &'static str {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "mush-cli-macos-aarch64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "mush-cli-macos-x86_64"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "mush-cli-linux-x86_64"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "mush-cli-windows-x86_64.exe"
     }
     #[cfg(not(any(
         all(target_os = "macos", target_arch = "aarch64"),
