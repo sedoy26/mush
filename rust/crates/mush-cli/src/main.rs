@@ -2956,10 +2956,11 @@ fn settings_lines(state: &AppState, ui: &UiLocalState) -> Vec<String> {
                     if state.sample.play_enabled { "ON " } else { "OFF" }
                 ),
             ),
+            " ".to_string(),
             selected(
                 22,
                 format!(
-                    "Auto updt  {}",
+                    " Auto update {}",
                     if state.ui.auto_update { "ON " } else { "OFF" }
                 ),
             ),
