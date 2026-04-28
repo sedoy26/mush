@@ -16,7 +16,30 @@ permissions:
   contents: write
 
 jobs:
+  version_check:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure tag matches Cargo workspace version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_ver="$(awk -F'=' '/^\[workspace.package\]/{in_wp=1;next} in_wp && $1 ~ /^[[:space:]]*version[[:space:]]*$/ {gsub(/[[:space:]\"]/, "", $2); print $2; exit}' rust/Cargo.toml)"
+          if [ -z "${cargo_ver:-}" ]; then
+            echo "Could not read [workspace.package].version from rust/Cargo.toml"
+            exit 1
+          fi
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "Version mismatch: tag is v$tag but Cargo workspace version is $cargo_ver"
+            exit 1
+          fi
+          echo "Version OK: v$tag matches Cargo workspace version $cargo_ver"
+
   build:
+    needs: version_check
+    if: github.ref_type != 'tag' || needs.version_check.result == 'success'
     strategy:
       fail-fast: false
       matrix:
