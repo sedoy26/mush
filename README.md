@@ -32,11 +32,11 @@ For tagged versions (e.g. **v0.0.1**), pre-built **`mush-cli`** binaries are att
 1. Download the asset that matches your OS.
 2. **macOS / Linux:** `chmod +x mush-cli-*` then run `./mush-cli-…` from a terminal.
 3. **Windows:** run `mush-cli-windows-x86_64.exe` from PowerShell or cmd.
-4. Run from the **repository root** (same folder as `projects/` and `wav/`) so paths match the shell version.
+4. Run `mush-cli` from anywhere; it auto-uses the binary's folder for `projects/` and `wav/` (created on first run). To share data with the shell script version, run it from the repository root.
 
 You still need a working audio device. **Camera** visual mode additionally expects **`ffmpeg`** on your `PATH` (optional for everything else).
 
-The Rust runtime now mirrors the main `mush` feature set and uses the same top-level `projects/` and `wav/` folders when run from the repository root.
+The Rust runtime now mirrors the main `mush` feature set and stores data in top-level `projects/` and `wav/` next to the executable (or next to `mu.sh` when run from the repo).
 
 ## Status
 

@@ -84,6 +84,13 @@ fn detect_base_dir() -> Result<PathBuf> {
             }
         }
     }
+    // For standalone release binaries, anchor runtime data next to the executable.
+    // This avoids surprising behavior when users launch from a shell whose cwd is unrelated.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return Ok(parent.to_path_buf());
+        }
+    }
     Ok(cwd)
 }
 

@@ -19,7 +19,7 @@ Sample rate is dynamically set from the CPAL device (48kHz on most modern system
 
 ## Install without Cargo
 
-See **[GitHub Releases](https://github.com/sedoy26/mush/releases)** for pre-built `mush-cli` (v0.0.1+). Download the artifact for your OS, `chmod +x` on Unix, run from the **repo root** next to `projects/` and `wav/`. Optional: `ffmpeg` for camera mode.
+See **[GitHub Releases](https://github.com/sedoy26/mush/releases)** for pre-built `mush-cli` (v0.0.1+). Download the artifact for your OS, `chmod +x` on Unix, run from anywhere. The app auto-creates and uses `projects/` and `wav/` next to the executable. Optional: `ffmpeg` for camera mode.
 
 ## Startup (from source)
 
@@ -42,7 +42,7 @@ cd rust
 cargo run -p mush-cli
 ```
 
-When launched from the repo root, the Rust app uses the same top-level `projects/` and `wav/` folders as the shell version.
+By default, the Rust app stores data in `projects/` and `wav/` next to the `mush-cli` binary.
 
 ## Current runtime coverage
 
@@ -149,7 +149,7 @@ Key modules:
 ## Worth knowing
 
 - The Rust app uses actual key-release events when the terminal provides them, so note release behavior is cleaner than the old curses timeout approximation.
-- Running from the repo root is recommended so saved projects and WAV files stay in the same top-level folders as the shell app.
+- If you want to share data with the shell app (`mu.sh`), run `mush-cli` from the repository root so both use the same top-level folders.
 - The data model already includes the same main subsystems as the legacy app, making continued parity work easier and safer than editing a giant heredoc.
 - Camera mode shells out to `ffmpeg` on macOS using `avfoundation`; set `MUSH_CAMERA_DEVICE` if you need a different camera index.
 
