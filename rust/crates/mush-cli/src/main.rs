@@ -2237,6 +2237,7 @@ fn theme_scope_seq(theme: Theme) -> &'static str {
         Theme::Mint => "\x1b[36;49m",
         Theme::Amber => "\x1b[33;49m",
         Theme::Ocean => "\x1b[34;49m",
+        Theme::HackerGreen => "\x1b[32;49m",
     }
 }
 
@@ -2246,6 +2247,7 @@ fn theme_rgb(theme: Theme) -> (u8, u8, u8) {
         Theme::Mint => (100, 220, 200),
         Theme::Amber => (220, 180, 100),
         Theme::Ocean => (90, 150, 240),
+        Theme::HackerGreen => (60, 240, 110),
     }
 }
 
@@ -2255,6 +2257,7 @@ fn theme_header_seq(theme: Theme) -> &'static str {
         Theme::Mint => "\x1b[30;46;1m",
         Theme::Amber => "\x1b[30;43;1m",
         Theme::Ocean => "\x1b[30;44;1m",
+        Theme::HackerGreen => "\x1b[30;42;1m",
     }
 }
 
@@ -2457,6 +2460,7 @@ fn theme_name(theme: Theme) -> &'static str {
         Theme::Mint => "MINT",
         Theme::Amber => "AMBER",
         Theme::Ocean => "OCEAN",
+        Theme::HackerGreen => "HACKER GREEN",
     }
 }
 
@@ -3581,7 +3585,13 @@ fn cycle_visual_fx(style: VisualFx, delta: i32) -> VisualFx {
 }
 
 fn cycle_theme(theme: Theme, delta: i32) -> Theme {
-    let all = [Theme::Magenta, Theme::Mint, Theme::Amber, Theme::Ocean];
+    let all = [
+        Theme::Magenta,
+        Theme::Mint,
+        Theme::Amber,
+        Theme::Ocean,
+        Theme::HackerGreen,
+    ];
     let idx = all.iter().position(|item| *item == theme).unwrap_or(0);
     all[(idx as i32 + delta).rem_euclid(all.len() as i32) as usize]
 }
